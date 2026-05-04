@@ -162,14 +162,20 @@ logger.info("loaded %d table specs from %s", len(TABLES), PK_METADATA_CSV)
 
 
 def src_path_for(spec: TableSpec) -> str:
-    return f"{SOURCE_ROOT.rstrip('/')}/{spec['src_db']}/{spec['src_table']}/{SOURCE_VERSION}/"
+    # Container paths are uppercase; specs are normalized lowercase for the
+    # lab side, so upper() the segments when building the source URI.
+    return (
+        f"{SOURCE_ROOT.rstrip('/')}/"
+        f"{spec['src_db'].upper()}/{spec['src_table'].upper()}/"
+        f"{SOURCE_VERSION}/"
+    )
 
 
 def dst_table_for(spec: TableSpec) -> str:
     name: Optional[str] = spec.get("dst_table")
     if name:
         return name if "." in name else f"{LAB_DB}.{name}"
-    return f"{LAB_DB}.{spec['src_db']}__{spec['src_table']}"
+    return f"{LAB_DB}.{spec['src_table']}"
 
 
 def require_pks(spec: TableSpec) -> List[str]:
