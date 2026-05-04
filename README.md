@@ -151,6 +151,32 @@ Install the built wheel:
 python -m pip install dist/spark_lib-0.1.0-py3-none-any.whl
 ```
 
+## Synapse Bootstrap
+
+When Synapse workspace imports are inconvenient, copy `synapse_bootstrap.py`
+and the built wheel to ADLS, then load the bootstrap file in a notebook:
+
+```python
+code = mssparkutils.fs.head(
+    "abfss://<container>@<account>.dfs.core.windows.net/libs/synapse_bootstrap.py",
+    200000,
+)
+exec(code)
+
+install_wheel_from_abfss(
+    "abfss://<container>@<account>.dfs.core.windows.net/libs/spark_lib-0.1.0-py3-none-any.whl"
+)
+```
+
+For a one-off single-file load, the bootstrap also exposes:
+
+```python
+exec_py_from_abfss(
+    "abfss://<container>@<account>.dfs.core.windows.net/libs/some_file.py",
+    globals(),
+)
+```
+
 ## Notes
 
 - The package never creates a SparkSession.
