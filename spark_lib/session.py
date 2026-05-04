@@ -5,8 +5,7 @@ one, and local PySpark jobs should register or activate one explicitly.
 """
 from __future__ import annotations
 
-import inspect
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from pyspark.sql import SparkSession
@@ -38,10 +37,6 @@ def get_spark() -> "SparkSession":
     if active is not None:
         return active
 
-    frame_session: Optional["SparkSession"] = _spark_from_call_stack()
-    if frame_session is not None:
-        return frame_session
-
     raise RuntimeError(
         "No active SparkSession found. In Synapse this should usually be "
         "available automatically; otherwise call spark_lib.set_spark(spark) "
@@ -56,26 +51,6 @@ def _active_spark_session() -> Optional["SparkSession"]:
     except ImportError:
         return None
     return SparkSession.getActiveSession()
-
-
-def _spark_from_call_stack() -> Optional["SparkSession"]:
-    """Find a notebook/global `spark` symbol as a Synapse-friendly fallback."""
-    for frame_info in inspect.stack()[2:]:
-        frame = frame_info.frame
-        candidate: Any = frame.f_locals.get("spark", frame.f_globals.get("spark"))
-        if _looks_like_spark(candidate):
-            return candidate
-    return None
-
-
-def _looks_like_spark(value: Any) -> bool:
-    """Duck-type SparkSession to avoid importing PySpark during package import."""
-    return (
-        value is not None
-        and hasattr(value, "read")
-        and hasattr(value, "table")
-        and hasattr(value, "sparkContext")
-    )
 
 
 __all__ = ["get_spark", "set_spark"]

@@ -10,6 +10,7 @@ call `spark_lib.set_spark(spark)` once before executing transforms.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from functools import wraps
@@ -119,9 +120,14 @@ def _as_list(x: PartitionLike) -> List[str]:
 
 
 def _local_tmp(path: PathLike) -> str:
-    """Map a remote report path to a driver-local temp file path."""
+    """Map a remote report path to a driver-local temp file path.
+
+    Hashed so concurrent jobs writing to different abfss paths with the same
+    basename do not collide on the staging file.
+    """
     base: str = os.path.basename(path.rstrip("/")) or "_tmp"
-    return "/tmp/" + base
+    digest: str = hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
+    return f"/tmp/{digest}_{base}"
 
 
 def _nbutils() -> Any:
@@ -159,6 +165,7 @@ class Input:
         self.path = path
         self.format = format
         self.options = dict(options)
+        self._resolved_fmt: Optional[str] = None
 
     @classmethod
     def table(cls, name: str, **options: Any) -> "Input":
@@ -166,14 +173,23 @@ class Input:
 
     @property
     def fmt(self) -> str:
-        """Resolve the input format, peeking only for unmarked abfss folders."""
+        """Resolve the input format, peeking only for unmarked abfss folders.
+
+        Cached so repeated reads (or `inp.fmt` accessed for logging then
+        reading) do not trigger multiple `fs.ls` calls.
+        """
+        if self._resolved_fmt is not None:
+            return self._resolved_fmt
         if self.format:
-            return self.format
+            self._resolved_fmt = self.format
+            return self._resolved_fmt
         inferred: Optional[str] = _infer_format(self.path)
         if inferred is not None:
-            return inferred
+            self._resolved_fmt = inferred
+            return self._resolved_fmt
         peeked: Optional[str] = _peek_format(self.path)
-        return peeked or "delta"
+        self._resolved_fmt = peeked or "delta"
+        return self._resolved_fmt
 
     def dataframe(self) -> "DataFrame":
         spark = get_spark()
@@ -189,7 +205,7 @@ class Input:
 
         if fmt == "csv":
             reader = reader.option("header", opts.pop("header", "true"))
-            reader = reader.option("inferSchema", opts.pop("inferSchema", "true"))
+            reader = reader.option("inferSchema", opts.pop("inferSchema", "false"))
             if self.path.lower().endswith(".tsv"):
                 reader = reader.option("sep", opts.pop("sep", "\t"))
 
@@ -211,6 +227,8 @@ class Output:
     format: Optional[str] = None
     mode: str = "overwrite"
     partition_by: Optional[PartitionLike] = None
+    table_format: str = "delta"
+    merge_on: Optional[PartitionLike] = None
     options: Dict[str, Any] = field(default_factory=dict)
 
     def __init__(
@@ -219,12 +237,16 @@ class Output:
         format: Optional[str] = None,
         mode: str = "overwrite",
         partition_by: Optional[PartitionLike] = None,
+        table_format: str = "delta",
+        merge_on: Optional[PartitionLike] = None,
         **options: Any,
     ) -> None:
         self.path = path
         self.format = format
         self.mode = mode
         self.partition_by = partition_by
+        self.table_format = table_format
+        self.merge_on = merge_on
         self.options = dict(options)
 
     @classmethod
@@ -235,6 +257,7 @@ class Output:
         mode: str = "overwrite",
         format: str = "delta",
         partition_by: Optional[PartitionLike] = None,
+        merge_on: Optional[PartitionLike] = None,
         **options: Any,
     ) -> "Output":
         return cls(
@@ -242,7 +265,9 @@ class Output:
             format="table",
             mode=mode,
             partition_by=partition_by,
-            **{"_table_format": format, **options},
+            table_format=format,
+            merge_on=merge_on,
+            **options,
         )
 
     @property
@@ -257,6 +282,14 @@ class Output:
     def write(self, df: WriteData) -> None:
         fmt: str = self.fmt
 
+        if self.mode == "merge":
+            if self.merge_on is None:
+                raise ValueError("mode='merge' requires merge_on=")
+            if isinstance(df, dict):
+                raise TypeError("merge does not support Dict[str, DataFrame]")
+            self.merge_into(df, on=self.merge_on)
+            return
+
         if fmt == "excel":
             _write_excel(df, self.path, **self.options)
             return
@@ -270,8 +303,7 @@ class Output:
         opts: Dict[str, Any] = dict(self.options)
 
         if fmt == "table":
-            tbl_fmt: str = opts.pop("_table_format", "delta")
-            writer: Any = df.write.format(tbl_fmt).mode(self.mode)
+            writer: Any = df.write.format(self.table_format).mode(self.mode)
             for k, v in opts.items():
                 writer = writer.option(k, v)
             if self.partition_by is not None:

@@ -1,7 +1,7 @@
 """Importable package for Synapse notebook transform helpers."""
 from __future__ import annotations
 
-from .cleanup import clean_columns, dedupe, log, quiet_azure_logging, run_parallel
+from .cleanup import clean_columns, dedupe, quiet_azure_logging, run_parallel
 from .matching import (
     fill_missing_from_match,
     fuzzy_match,
@@ -22,7 +22,6 @@ __all__ = [
     "fuzzy_match",
     "get_spark",
     "infer_key_from_text",
-    "log",
     "ml_fuzzy_match",
     "normalize_text",
     "quiet_azure_logging",

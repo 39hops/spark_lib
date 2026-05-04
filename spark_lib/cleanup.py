@@ -177,9 +177,14 @@ def run_parallel(
     )
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_worker, i, j) for i, j in enumerate(jobs)]
-        for fut in as_completed(futures):
-            idx, value = fut.result()
-            results[idx] = value
+        try:
+            for fut in as_completed(futures):
+                idx, value = fut.result()
+                results[idx] = value
+        except BaseException:
+            for f in futures:
+                f.cancel()
+            raise
 
     failures: int = sum(1 for r in results if isinstance(r, BaseException))
     if failures:

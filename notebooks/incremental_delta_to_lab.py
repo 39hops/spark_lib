@@ -183,10 +183,25 @@ def table_exists(name: str) -> bool:
 
 
 def current_delta_version(path: str) -> int:
-    row: Optional[Row] = DeltaTable.forPath(spark, path).history(1).select("version").first()
-    if row is None:
-        raise ValueError(f"No Delta history found at {path}")
-    return int(row["version"])
+    # `DeltaTable.forPath` is strict about URI form and rejects some otherwise-
+    # readable Delta folders (Synapse Link landing zones, trailing-slash quirks).
+    # Try `DESCRIBE HISTORY` first, then fall back to listing `_delta_log/`.
+    p: str = path.rstrip("/")
+    try:
+        row: Optional[Row] = spark.sql(f"DESCRIBE HISTORY delta.`{p}`").select("version").first()
+        if row is not None:
+            return int(row["version"])
+    except Exception:
+        pass
+    entries: List[Any] = list(mssparkutils.fs.ls(f"{p}/_delta_log"))
+    versions: List[int] = [
+        int(e.name.split(".")[0])
+        for e in entries
+        if e.name.endswith(".json") and e.name[0].isdigit()
+    ]
+    if not versions:
+        raise ValueError(f"No Delta commits found at {path}")
+    return max(versions)
 
 
 def ensure_state_table() -> None:
