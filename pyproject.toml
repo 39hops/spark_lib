@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spark-lib"
+version = "0.1.0"
+description = "Small Synapse Spark notebook helpers inspired by transforms.api."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+excel = ["pandas", "openpyxl"]
+spark = ["pyspark"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spark_lib*"]

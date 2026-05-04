@@ -1,0 +1,14 @@
+MEMORY.md
+memory.md
+CODEX.md
+CLAUDE.md
+.venv/
+.claude/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
