@@ -117,6 +117,7 @@ def load_specs(path: str) -> List[SyncSpec]:
 # COMMAND ----------
 specs: List[SyncSpec] = load_specs(PK_METADATA_CSV)
 state: SyncState = SyncState(STATE_TABLE)
+state.ensure()
 successes, failures = run_sync(specs, state, max_workers=MAX_WORKERS, pool="delta_sync")
 
 if successes:
