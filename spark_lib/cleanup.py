@@ -14,6 +14,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     TypeVar,
     Union,
@@ -196,9 +197,83 @@ def run_parallel(
     return results
 
 
+def drop_database_tables(
+    database: str,
+    *,
+    tables: Optional[Iterable[str]] = None,
+    include_views: bool = False,
+    max_workers: int = 8,
+    pool: Optional[str] = None,
+    dry_run: bool = False,
+) -> List[Union[str, BaseException]]:
+    """Drop managed/external tables in ``database`` concurrently.
+
+    Args:
+        database: Database/schema to clean.
+        tables: Optional table-name allowlist. Names are unqualified.
+        include_views: When ``True``, also drop views from the database.
+        max_workers: Thread count passed to :func:`run_parallel`.
+        pool: Optional Spark FAIR scheduler pool.
+        dry_run: Return the objects that would be dropped without executing.
+
+    Returns:
+        Ordered ``List[str | BaseException]`` matching :func:`run_parallel`.
+        Successful entries are fully-qualified object names.
+    """
+    spark: Any = get_spark()
+    selected: Optional[Set[str]] = set(tables) if tables is not None else None
+    jobs: List[Dict[str, Any]] = []
+    for entry in spark.catalog.listTables(database):
+        name: str = str(entry.name)
+        if bool(getattr(entry, "isTemporary", False)):
+            continue
+        if selected is not None and name not in selected:
+            continue
+
+        table_type: str = str(getattr(entry, "tableType", "")).upper()
+        is_view: bool = table_type == "VIEW"
+        if is_view and not include_views:
+            continue
+
+        kind: str = "VIEW" if is_view else "TABLE"
+        qualified: str = f"{database}.{name}"
+        jobs.append({
+            "name": qualified,
+            "object_name": qualified,
+            "statement": (
+                f"DROP {kind} IF EXISTS "
+                f"{_qualified_identifier(database, name)}"
+            ),
+        })
+
+    def _drop_table(object_name: str, statement: str, name: str = "") -> str:
+        if dry_run:
+            log.info("[dry-run] %s", statement)
+            return object_name
+        spark.sql(statement)
+        return object_name
+
+    return run_parallel(
+        _drop_table,
+        jobs,
+        max_workers=max_workers,
+        pool=pool,
+        fail_fast=False,
+    )
+
+
+def _qualified_identifier(database: str, table: str) -> str:
+    return f"{_quote_identifier(database)}.{_quote_identifier(table)}"
+
+
+def _quote_identifier(identifier: str) -> str:
+    return f"`{identifier.replace('`', '``')}`"
+
+
 __all__: List[str] = [
     "clean_columns",
     "dedupe",
+    "drop_database_tables",
     "log",
     "quiet_azure_logging",
     "run_parallel",

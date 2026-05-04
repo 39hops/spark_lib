@@ -123,6 +123,20 @@ in-flight futures. Otherwise, exceptions are returned in-place inside the
 results list and a single warning per failure is logged (full tracebacks
 go to debug level).
 
+### `drop_database_tables(database, *, tables=None, include_views=False, max_workers=8, pool=None, dry_run=False)`
+
+Drops all managed/external tables in a database concurrently. Views are skipped
+unless `include_views=True`.
+
+```python
+from spark_lib import drop_database_tables
+
+results = drop_database_tables("lab", max_workers=8)
+failures = [r for r in results if isinstance(r, BaseException)]
+if failures:
+    raise RuntimeError(f"{len(failures)} drops failed")
+```
+
 ### `quiet_azure_logging(level=WARNING)`
 
 Raises noisy Azure / py4j / msal / urllib3 loggers above normal notebook

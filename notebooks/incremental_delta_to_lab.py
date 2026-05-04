@@ -14,9 +14,18 @@ LAB_DB: str = "lab"
 STATE_TABLE: str = f"{LAB_DB}.__spark_lib_delta_sync_state"
 MAX_WORKERS: int = 8
 PK_METADATA_CSV: str = "abfss://<container>@<account>.dfs.core.windows.net/config/table_primary_keys.csv"
+SPARK_CONF: Dict[str, Any] = {
+    "spark.databricks.delta.schema.autoMerge.enabled": "true",
+}
 
+
+def apply_spark_conf(conf: Dict[str, Any]) -> None:
+    for key, value in conf.items():
+        spark.conf.set(key, value)
+
+
+apply_spark_conf(SPARK_CONF)
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {LAB_DB}")
-
 set_spark(spark)
 quiet_azure_logging()
 

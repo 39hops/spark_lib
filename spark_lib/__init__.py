@@ -1,7 +1,13 @@
 """Importable package for Synapse notebook transform helpers."""
 from __future__ import annotations
 
-from .cleanup import clean_columns, dedupe, quiet_azure_logging, run_parallel
+from .cleanup import (
+    clean_columns,
+    dedupe,
+    drop_database_tables,
+    quiet_azure_logging,
+    run_parallel,
+)
 from .delta import (
     DEFAULT_CDF_METADATA,
     cdf_merge,
@@ -35,6 +41,7 @@ __all__ = [
     "column_map",
     "current_delta_version",
     "dedupe",
+    "drop_database_tables",
     "fill_missing_from_match",
     "fuzzy_match",
     "get_spark",
