@@ -57,13 +57,20 @@ _FORMAT_BY_EXT: Dict[str, str] = {
     ".delta": "delta",
 }
 
+# Spark may write compressed part files such as `part-000.snappy.parquet`.
+# When peeking into a folder, strip compression suffixes before checking the
+# actual data extension.
 _COMPRESSION_SUFFIXES: Tuple[str, ...] = (
     ".gz", ".snappy", ".zstd", ".zst", ".lz4", ".bz2", ".deflate",
 )
 
 
 def _infer_format(path: PathLike) -> Optional[str]:
-    """Guess a Spark format from a path string alone."""
+    """Guess a Spark format from a path string alone.
+
+    This stays pure and cheap. Bare `abfss://` folders return `None` so callers
+    can decide whether to spend a metadata call peeking into the directory.
+    """
     ext: str = os.path.splitext(path.lower().rstrip("/"))[1]
     if ext in _FORMAT_BY_EXT:
         return _FORMAT_BY_EXT[ext]
@@ -73,7 +80,13 @@ def _infer_format(path: PathLike) -> Optional[str]:
 
 
 def _peek_format(path: PathLike) -> Optional[str]:
-    """Inspect an abfss directory's contents to infer its format."""
+    """Inspect an abfss directory's contents to infer its format.
+
+    Delta folders are identified by `_delta_log`; otherwise we use the first
+    Spark `part-*` file extension. Failures return `None` because peeking is a
+    convenience, not a reason to break a notebook before Spark gets a chance to
+    read with the default format.
+    """
     try:
         entries: List[Any] = list(_nbutils().fs.ls(path))
     except Exception:  # noqa: BLE001 - peek is best-effort
@@ -106,6 +119,7 @@ def _as_list(x: PartitionLike) -> List[str]:
 
 
 def _local_tmp(path: PathLike) -> str:
+    """Map a remote report path to a driver-local temp file path."""
     base: str = os.path.basename(path.rstrip("/")) or "_tmp"
     return "/tmp/" + base
 
@@ -142,6 +156,7 @@ class Input:
 
     @property
     def fmt(self) -> str:
+        """Resolve the input format, peeking only for unmarked abfss folders."""
         if self.format:
             return self.format
         inferred: Optional[str] = _infer_format(self.path)
@@ -208,6 +223,11 @@ class Output:
 
     @property
     def fmt(self) -> str:
+        """Resolve the output format without remote I/O.
+
+        Outputs may not exist yet, so an unmarked `abfss://` path defaults to
+        delta instead of trying to inspect the destination.
+        """
         return self.format or _infer_format(self.path) or "delta"
 
     def write(self, df: WriteData) -> None:
@@ -281,6 +301,7 @@ def _read_excel(
     sheet_name: Union[str, int] = 0,
     **kwargs: Any,
 ) -> "DataFrame":
+    """Read xlsx through pandas, then lift the result into Spark."""
     import pandas as pd
 
     if _is_abfss(path):
@@ -298,7 +319,11 @@ def _write_excel(
     sheet_name: str = "Sheet1",
     **kwargs: Any,
 ) -> None:
-    """Write one or many DataFrames to a single .xlsx file."""
+    """Write one or many DataFrames to a single .xlsx file.
+
+    Excel is intentionally driver-side. This is useful for report-sized data,
+    not large tables.
+    """
     import pandas as pd
 
     if isinstance(data, dict):

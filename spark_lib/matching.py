@@ -1,4 +1,9 @@
-"""Keyword search and fuzzy matching helpers for Spark DataFrames."""
+"""Keyword search and fuzzy matching helpers for Spark DataFrames.
+
+The matching helpers are built to stay auditable: every inferred value comes
+with the matched text plus score/distance columns so users can review fuzzy
+decisions instead of silently trusting them.
+"""
 from __future__ import annotations
 
 from typing import (
@@ -33,7 +38,12 @@ _ASCII_CHARS = "aaaaaaaaacccdeeeeeeeeiiiiiilnnooooooorsstuuuuuuyyzzz"
 
 
 def normalize_text(col: Union[str, "Column"]) -> "Column":
-    """Return a Spark Column normalized for matching."""
+    """Return a Spark Column normalized for matching.
+
+    The expression is Spark-native: no Python UDF, no driver collect. It
+    lowercases, transliterates common accents, removes punctuation, and
+    collapses whitespace.
+    """
     from pyspark.sql import functions as F
 
     expr: "Column" = F.col(col) if isinstance(col, str) else col
@@ -54,7 +64,12 @@ def search_database(
     sample_rows: int = 1,
     limit_tables: Optional[int] = None,
 ) -> "DataFrame":
-    """Search string columns in a database and return match counts/samples."""
+    """Search string columns in a database and return match counts/samples.
+
+    This intentionally scans only string columns. It performs actions
+    (`count`, `collect` for samples), so use `tables=` or `limit_tables=` when
+    exploring large schemas.
+    """
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
         ArrayType,
@@ -138,7 +153,12 @@ def fuzzy_match(
     min_chars: int = 2,
     keep_all_candidates: bool = False,
 ) -> "DataFrame":
-    """Return fuzzy matches between two DataFrames, ranked per left row."""
+    """Return Levenshtein fuzzy matches, ranked per left row.
+
+    This path is transparent and easy to reason about. Without `block_on`, it
+    joins only rows with the same first two normalized characters to avoid a
+    full cross join.
+    """
     from pyspark.sql import Window
     from pyspark.sql import functions as F
 
@@ -332,7 +352,12 @@ def ml_fuzzy_match(
     num_hash_tables: int = 3,
     keep_all_candidates: bool = False,
 ) -> "DataFrame":
-    """Return fuzzy matches using PySpark ML MinHashLSH over char n-grams."""
+    """Return fuzzy matches using PySpark ML MinHashLSH over char n-grams.
+
+    Character n-grams are better for business names than plain word tokens:
+    they can still line up strings like `Wal Mart` and `Walmart`. MinHashLSH
+    returns approximate Jaccard distance over hashed n-gram sets.
+    """
     from pyspark.ml.feature import HashingTF, MinHashLSH
     from pyspark.sql import Window
     from pyspark.sql import functions as F
@@ -402,6 +427,8 @@ def ml_fuzzy_match(
     lfeat = lfeat.where(F.size(F.col(_TOKENS)) > 0)
     rfeat = rfeat.where(F.size(F.col(_TOKENS)) > 0)
 
+    # MinHashLSH only needs the feature schema/distribution to fit hash
+    # functions. Unioning both sides keeps the model symmetric for joins.
     fit_data = lfeat.select(_FEATURES).unionByName(rfeat.select(_FEATURES))
     model = MinHashLSH(
         inputCol=_FEATURES,
@@ -462,7 +489,7 @@ def infer_key_from_text(
 
     `reference` should contain the trusted key/text pairs, such as
     `(business_id, business_name)`. `left` may have a null key column or no
-    key column at all.
+    key column at all. By default this uses the PySpark ML MinHashLSH matcher.
     """
     from pyspark.sql import functions as F
 
@@ -553,6 +580,7 @@ def infer_key_from_text(
 
 
 def _with_key(df: "DataFrame", key: str, create: bool) -> "DataFrame":
+    """Add a stable row key only when the caller did not provide one."""
     if not create:
         return df
     from pyspark.sql import functions as F
@@ -584,6 +612,7 @@ def _ml_block_condition(blocks: List[str]) -> "Column":
 
 
 def _char_ngrams(col: str, n: int) -> "Column":
+    """Build character n-grams as an array column for HashingTF."""
     from pyspark.sql import functions as F
 
     empty = F.array().cast("array<string>")

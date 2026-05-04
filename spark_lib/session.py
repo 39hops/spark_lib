@@ -15,7 +15,12 @@ _spark: Optional["SparkSession"] = None
 
 
 def set_spark(session: "SparkSession") -> None:
-    """Register the SparkSession used by spark_lib."""
+    """Register the SparkSession used by spark_lib.
+
+    Use this in local scripts/tests or any runtime where Spark does not expose
+    an active session. Synapse notebooks usually do not need it because Spark is
+    already active before user code runs.
+    """
     global _spark
     _spark = session
 
@@ -45,6 +50,7 @@ def get_spark() -> "SparkSession":
 
 
 def _active_spark_session() -> Optional["SparkSession"]:
+    """Return Spark's active session without creating one."""
     try:
         from pyspark.sql import SparkSession
     except ImportError:
@@ -53,6 +59,7 @@ def _active_spark_session() -> Optional["SparkSession"]:
 
 
 def _spark_from_call_stack() -> Optional["SparkSession"]:
+    """Find a notebook/global `spark` symbol as a Synapse-friendly fallback."""
     for frame_info in inspect.stack()[2:]:
         frame = frame_info.frame
         candidate: Any = frame.f_locals.get("spark", frame.f_globals.get("spark"))
@@ -62,6 +69,7 @@ def _spark_from_call_stack() -> Optional["SparkSession"]:
 
 
 def _looks_like_spark(value: Any) -> bool:
+    """Duck-type SparkSession to avoid importing PySpark during package import."""
     return (
         value is not None
         and hasattr(value, "read")

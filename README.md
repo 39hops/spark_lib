@@ -1,6 +1,7 @@
 # spark_lib
 
 Small `transforms.api`-style helpers for Azure Synapse Spark notebooks.
+Made by Artin.
 
 The library keeps the original notebook-friendly API while also working as an
 importable Python package:
@@ -133,3 +134,7 @@ python -m pip install -e ".[excel]"
   data, not bulk datasets.
 - `run_parallel` uses threads and assumes Spark FAIR scheduling is configured
   at session start when using scheduler pools.
+
+## License
+
+MIT License. Copyright (c) 2026 Artin.

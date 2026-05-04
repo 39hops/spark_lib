@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Small Synapse Spark notebook helpers inspired by transforms.api."
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Artin" }]
 dependencies = []
 
 [project.optional-dependencies]
