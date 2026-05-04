@@ -1,0 +1,4 @@
+build>=1.2
+pandas
+openpyxl
+pyspark

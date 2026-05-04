@@ -123,6 +123,34 @@ For Excel support, install the optional dependencies:
 python -m pip install -e ".[excel]"
 ```
 
+For a local dev environment with build tooling, Spark, and Excel dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+## Build A Wheel
+
+Build the wheel from the repo root:
+
+```bash
+python -m pip install --upgrade build
+python -m build --wheel
+```
+
+The wheel will be written to `dist/`, for example:
+
+```text
+dist/spark_lib-0.1.0-py3-none-any.whl
+```
+
+Install the built wheel:
+
+```bash
+python -m pip install dist/spark_lib-0.1.0-py3-none-any.whl
+```
+
 ## Notes
 
 - The package never creates a SparkSession.
