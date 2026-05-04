@@ -28,6 +28,7 @@ spark.sql(f"CREATE DATABASE IF NOT EXISTS {LAB_DB}")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
 # COMMAND ----------
+import builtins
 import json
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Set, TypedDict, Union, cast
@@ -213,7 +214,7 @@ def current_delta_version(path: str) -> Optional[int]:
         for e in entries
         if e.name.endswith(".json") and e.name[0].isdigit()
     ]
-    return max(versions) if versions else None
+    return builtins.max(versions) if versions else None
 
 
 def ensure_state_table() -> None:
