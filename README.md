@@ -27,6 +27,7 @@ spark_lib.set_spark(spark)
 - Format inference for delta, parquet, csv, tsv, json, orc, avro, and xlsx.
 - Excel read/write support through pandas and Synapse filesystem utilities.
 - `clean_columns`, `dedupe`, `quiet_azure_logging`, and `run_parallel`.
+- Database keyword search and fuzzy matching helpers for filling missing fields.
 
 ## Example
 
@@ -47,6 +48,54 @@ def daily_orders(orders, customers):
 
 daily_orders()
 ```
+
+## Matching Helpers
+
+```python
+from spark_lib import (
+    fill_missing_from_match,
+    fuzzy_match,
+    infer_key_from_text,
+    ml_fuzzy_match,
+    search_database,
+)
+
+hits = search_database("sales", "acme", limit_tables=20)
+
+matches = fuzzy_match(
+    left=orders,
+    right=customers,
+    left_on="customer_name",
+    right_on="legal_name",
+    block_on="country",
+    threshold=0.82,
+)
+
+filled = fill_missing_from_match(
+    left=orders,
+    right=customers,
+    left_on="customer_name",
+    right_on="legal_name",
+    fill_cols=["customer_id", "billing_city"],
+    block_on="country",
+    threshold=0.82,
+)
+
+resolved = infer_key_from_text(
+    left=missing_ids,
+    reference=known_businesses,
+    key_col="business_id",
+    text_col="business_name",
+    method="ml",
+    threshold=0.84,
+)
+```
+
+`infer_key_from_text(..., method="ml")` and `ml_fuzzy_match` use PySpark ML
+`HashingTF` plus `MinHashLSH` over normalized business-name character n-grams.
+The lower level `fuzzy_match` helper uses Levenshtein scoring. Pass `block_on=`
+when possible so candidate generation stays small. Filled outputs include audit
+columns for the matched right-side row, score, and distance.
 
 ## Compatibility Imports
 
