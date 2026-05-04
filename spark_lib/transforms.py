@@ -142,7 +142,7 @@ def _nbutils() -> Any:
 
 # ---------- Input -----------------------------------------------------------
 
-@dataclass
+@dataclass(init=False)
 class Input:
     """A lazy reference to a dataset. Call `.dataframe()` to materialize."""
 
@@ -150,9 +150,19 @@ class Input:
     format: Optional[str] = None
     options: Dict[str, Any] = field(default_factory=dict)
 
+    def __init__(
+        self,
+        path: PathLike,
+        format: Optional[str] = None,
+        **options: Any,
+    ) -> None:
+        self.path = path
+        self.format = format
+        self.options = dict(options)
+
     @classmethod
     def table(cls, name: str, **options: Any) -> "Input":
-        return cls(path=name, format="table", options=dict(options))
+        return cls(path=name, format="table", **options)
 
     @property
     def fmt(self) -> str:
@@ -193,7 +203,7 @@ class Input:
 
 # ---------- Output ----------------------------------------------------------
 
-@dataclass
+@dataclass(init=False)
 class Output:
     """A sink. Call `.write(df)` or use a `@transform_df` decorator."""
 
@@ -202,6 +212,20 @@ class Output:
     mode: str = "overwrite"
     partition_by: Optional[PartitionLike] = None
     options: Dict[str, Any] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        path: PathLike,
+        format: Optional[str] = None,
+        mode: str = "overwrite",
+        partition_by: Optional[PartitionLike] = None,
+        **options: Any,
+    ) -> None:
+        self.path = path
+        self.format = format
+        self.mode = mode
+        self.partition_by = partition_by
+        self.options = dict(options)
 
     @classmethod
     def table(
@@ -218,7 +242,7 @@ class Output:
             format="table",
             mode=mode,
             partition_by=partition_by,
-            options={"_table_format": format, **options},
+            **{"_table_format": format, **options},
         )
 
     @property
