@@ -1,8 +1,29 @@
 """Delta Lake primitives: version lookup, snapshot merge, CDF merge.
 
-These helpers wrap the small set of `DeltaTable` boilerplate used across
-ingestion notebooks. They intentionally do nothing project-specific (no path
-conventions, no state tables) so they compose cleanly.
+This module wraps the small set of `DeltaTable` boilerplate used across
+ingestion notebooks. It intentionally contains no project-specific concerns
+(no path conventions, no state tables, no naming logic) so the helpers
+compose cleanly with whatever orchestration sits on top.
+
+Public API
+----------
+- ``current_delta_version(path)`` — file-only Delta version lookup.
+- ``snapshot_merge(target, df, on, *, delete_unmatched=True)`` — full upsert
+  with optional source-driven deletes.
+- ``cdf_merge(target, cdf, on)`` — apply a Change Data Feed onto a target.
+- ``read_cdf(path, start_version)`` — small reader convenience.
+- ``merge_condition(pks)`` and ``column_map(cols)`` — SQL-string builders.
+- ``DEFAULT_CDF_METADATA`` — CDF metadata column names.
+
+Conventions
+-----------
+- All functions assume Synapse-style paths (``abfss://``) and a registered
+  or active SparkSession (see :mod:`spark_lib.session`).
+- The target of a merge must already exist as a managed Delta table; the
+  higher-level :mod:`spark_lib.sync` module handles the create-if-missing
+  case.
+- ``current_delta_version`` uses ``notebookutils``/``mssparkutils`` for
+  filesystem reads. Outside Synapse it returns ``None``.
 """
 from __future__ import annotations
 
@@ -36,26 +57,73 @@ def merge_condition(
     target_alias: str = "t",
     source_alias: str = "s",
 ) -> str:
-    """Build a SQL merge predicate joining target and source on `pks`."""
+    """Build a SQL merge predicate joining target and source on ``pks``.
+
+    Args:
+        pks: Primary key columns to equate between target and source.
+        target_alias: Alias for the target side of the merge. Default ``"t"``.
+        source_alias: Alias for the source side of the merge. Default ``"s"``.
+
+    Returns:
+        A single SQL string of the form ``"t.k1 = s.k1 AND t.k2 = s.k2"``.
+
+    Example:
+        >>> merge_condition(["order_id", "tenant_id"])
+        't.order_id = s.order_id AND t.tenant_id = s.tenant_id'
+    """
     return " AND ".join(
         f"{target_alias}.{c} = {source_alias}.{c}" for c in pks
     )
 
 
 def column_map(cols: Iterable[str], prefix: str = "s") -> Dict[str, str]:
-    """`{col: f"{prefix}.{col}"}` for use with `whenMatchedUpdate(set=...)`."""
+    """Build the ``{column: "<prefix>.<column>"}`` map used by Delta merges.
+
+    Used as ``set=`` for ``whenMatchedUpdate`` and ``values=`` for
+    ``whenNotMatchedInsert`` so the merge writes every column from the
+    source side.
+
+    Args:
+        cols: Columns to include.
+        prefix: Source alias used in the SQL expression. Default ``"s"``.
+
+    Returns:
+        A dict mapping each column name to a SQL expression string.
+
+    Example:
+        >>> column_map(["order_id", "amount"])
+        {'order_id': 's.order_id', 'amount': 's.amount'}
+    """
     return {c: f"{prefix}.{c}" for c in cols}
 
 
 def current_delta_version(path: str) -> Optional[int]:
-    """Cheap file-only lookup of the latest Delta commit at `path`.
+    """Cheap file-only lookup of the latest Delta commit at ``path``.
 
-    Reads `_delta_log/_last_checkpoint` first and falls back to listing the
-    log directory. Returns `None` when neither is readable so callers can
-    decide whether to keep going. Avoids `DeltaTable.forPath` URI strictness
-    and `DESCRIBE HISTORY` scans.
+    Reads ``_delta_log/_last_checkpoint`` first (a tiny JSON file naming the
+    latest checkpoint version), falling back to listing the log directory
+    and picking the max numeric ``.json`` commit name. Returns ``None`` when
+    neither is readable so callers can decide whether to keep going.
 
-    Currently uses `notebookutils`/`mssparkutils` for filesystem access.
+    Why not ``DeltaTable.forPath`` or ``DESCRIBE HISTORY``:
+
+    - ``forPath`` is URI-strict and rejects some otherwise-readable Delta
+      folders (Synapse Link landing zones, trailing-slash quirks).
+    - ``DESCRIBE HISTORY`` triggers a full log scan even when only the
+      latest version is needed.
+
+    Args:
+        path: Source Delta folder URI (typically ``abfss://...``).
+
+    Returns:
+        The latest committed version, or ``None`` if it cannot be determined
+        (folder unreadable, no ``_delta_log``, or notebookutils unavailable).
+
+    Example:
+        >>> v = current_delta_version("abfss://raw@acct.../orders/")
+        >>> if v is None:
+        ...     # treat as snapshot
+        ...     ...
     """
     nb = _nbutils()
     if nb is None:
@@ -88,11 +156,29 @@ def snapshot_merge(
     *,
     delete_unmatched: bool = True,
 ) -> None:
-    """Upsert `df` into `target_table`, optionally deleting rows in target
-    that aren't present in source.
+    """Upsert ``df`` into ``target_table`` with optional source-driven deletes.
 
-    Use `delete_unmatched=True` to make the target a true mirror of the source
-    snapshot (preserving Delta time travel). The target must already exist.
+    Wraps the ``forName + merge + whenMatchedUpdate(set=...) +
+    whenNotMatchedInsert(values=...) + (whenNotMatchedBySourceDelete)`` chain
+    into one call. The target must already exist as a managed Delta table.
+
+    Args:
+        target_table: Fully-qualified managed Delta table name
+            (e.g. ``"lab.orders"``).
+        df: Source DataFrame to merge in. Should already be normalized
+            (e.g. column names matched to the target).
+        on: Primary key columns used for the merge predicate.
+        delete_unmatched: When ``True`` (default), rows present in the target
+            but not in the source are deleted via
+            ``whenNotMatchedBySourceDelete``. Set ``False`` for upsert-only.
+
+    Returns:
+        ``None``. The merge is executed in-place on the Delta target.
+
+    Example:
+        >>> snapshot_merge("lab.orders", new_snapshot, on=["order_id"])
+        >>> snapshot_merge("lab.orders", upserts, on=["order_id"],
+        ...                delete_unmatched=False)
     """
     from delta.tables import DeltaTable
 
@@ -117,14 +203,41 @@ def cdf_merge(
     *,
     metadata_cols: Set[str] = DEFAULT_CDF_METADATA,
 ) -> bool:
-    """Apply a Delta CDF DataFrame onto `target_table`.
+    """Apply a Delta Change Data Feed DataFrame onto ``target_table``.
 
-    `cdf` should be the result of `spark.read.format("delta").option(
-    "readChangeFeed", "true")...`. The function dedupes by primary key
-    (latest `commit_version`/`commit_timestamp` wins), filters
-    `update_preimage`, and applies inserts/updates/deletes to the target.
-    Returns `True` when at least one change was applied, `False` when CDF
-    yielded an empty window.
+    Behavior:
+
+    1. Filter ``change_type == 'update_preimage'`` (Delta emits both pre- and
+       post- images for updates; the post-image is the desired state).
+    2. Short-circuit and return ``False`` if no rows remain (empty window).
+    3. Dedupe by primary key, keeping the latest ``commit_version`` /
+       ``commit_timestamp`` per key — coalesces multiple changes per key
+       within the window.
+    4. Merge into the target: ``whenMatchedDelete`` for deletes,
+       ``whenMatchedUpdate`` for updates, ``whenNotMatchedInsert`` for
+       inserts. Metadata columns (``change_type`` etc.) are stripped from
+       data writes.
+
+    Args:
+        target_table: Fully-qualified managed Delta table name.
+        cdf: DataFrame from ``spark.read.format("delta").option(
+            "readChangeFeed", "true").option("startingVersion", N).load(...)``.
+            Use :func:`read_cdf` for a thin wrapper.
+        on: Primary key columns for merge predicate and dedup window.
+        metadata_cols: Set of column names to exclude from the data write.
+            Defaults to :data:`DEFAULT_CDF_METADATA`.
+
+    Returns:
+        ``True`` if a merge was applied, ``False`` if the CDF window was
+        empty (after filtering ``update_preimage``).
+
+    Raises:
+        Whatever ``DeltaTable.merge`` raises — typically when CDF is not
+        enabled on the source table, or columns are missing.
+
+    Example:
+        >>> cdf = read_cdf("abfss://raw@acct.../orders/", start_version=last + 1)
+        >>> applied = cdf_merge("lab.orders", cdf, on=["order_id"])
     """
     from delta.tables import DeltaTable
     from pyspark.sql import Window
@@ -165,7 +278,26 @@ def cdf_merge(
 
 
 def read_cdf(src_path: str, start_version: int) -> "DataFrame":
-    """Read the Delta change feed at `src_path` from `start_version` onward."""
+    """Read the Delta change feed at ``src_path`` from ``start_version`` onward.
+
+    A thin wrapper around the standard CDF reader incantation:
+
+    ``spark.read.format("delta").option("readChangeFeed", "true")
+    .option("startingVersion", N).load(src_path)``
+
+    Args:
+        src_path: Source Delta folder URI.
+        start_version: First commit version to include (inclusive).
+
+    Returns:
+        A DataFrame of CDF rows including ``change_type``, ``commit_version``,
+        ``commit_timestamp`` columns. Raises at action time if CDF is not
+        enabled on the source.
+
+    Example:
+        >>> cdf = read_cdf("abfss://raw@acct.../orders/", start_version=42)
+        >>> cdf.show()
+    """
     spark = get_spark()
     return (
         spark.read.format("delta")
