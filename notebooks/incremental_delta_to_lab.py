@@ -1,29 +1,3 @@
-# Notebook source
-# Incremental Delta Sync To Lab Managed Tables
-# Generated from notebooks/incremental_delta_to_lab.ipynb.
-
-# COMMAND ----------
-# # Incremental Delta Sync To Lab Managed Tables
-#
-# Reads source Delta tables from `{src_db}/{src_table}/{version}/` in ADLS and writes to managed Delta tables in a lab database.
-#
-# Snapshot or CDF decision, deletes, state tracking, and parallel orchestration are all in `spark_lib.sync`. The notebook only configures the project-specific naming and PK metadata.
-
-# COMMAND ----------
-# Configure these values for your environment.
-SOURCE_ROOT: str = "abfss://<container>@<account>.dfs.core.windows.net"
-SOURCE_VERSION: str = "1.2"
-LAB_DB: str = "lab"
-STATE_TABLE: str = f"{LAB_DB}.__spark_lib_delta_sync_state"
-MAX_WORKERS: int = 8
-
-# Metadata CSV: schema_name, table_name, column_name, position. One row per PK
-# column; composite keys are ordered by `position`.
-PK_METADATA_CSV: str = "abfss://<container>@<account>.dfs.core.windows.net/config/table_primary_keys.csv"
-
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {LAB_DB}")
-
-# COMMAND ----------
 from typing import Any, Dict, List, Set, cast
 
 from pyspark.sql import DataFrame, Row, Window, WindowSpec
@@ -34,13 +8,20 @@ from pyspark.sql.functions import (
 from spark_lib import Input, clean_columns, quiet_azure_logging, set_spark
 from spark_lib.sync import SyncSpec, SyncState, run_sync
 
+SOURCE_ROOT: str = "abfss://<container>@<account>.dfs.core.windows.net"
+SOURCE_VERSION: str = "1.2"
+LAB_DB: str = "lab"
+STATE_TABLE: str = f"{LAB_DB}.__spark_lib_delta_sync_state"
+MAX_WORKERS: int = 8
+PK_METADATA_CSV: str = "abfss://<container>@<account>.dfs.core.windows.net/config/table_primary_keys.csv"
+
+spark.sql(f"CREATE DATABASE IF NOT EXISTS {LAB_DB}")
+
 set_spark(spark)
 quiet_azure_logging()
 
 
 def src_path_for(src_db: str, src_table: str) -> str:
-    # Container paths are uppercase; specs are normalized lowercase for the
-    # lab side, so upper() the segments when building the source URI.
     return (
         f"{SOURCE_ROOT.rstrip('/')}/"
         f"{src_db.upper()}/{src_table.upper()}/"
@@ -114,7 +95,7 @@ def load_specs(path: str) -> List[SyncSpec]:
         })
     return specs
 
-# COMMAND ----------
+
 specs: List[SyncSpec] = load_specs(PK_METADATA_CSV)
 state: SyncState = SyncState(STATE_TABLE)
 state.ensure()
