@@ -160,11 +160,15 @@ def run_parallel(
         try:
             value: Any = fn(**job)
         except BaseException as exc:
-            log.exception(
-                "[%s] failed after %.1fs", name, time.monotonic() - t0
-            )
+            elapsed: float = time.monotonic() - t0
             if fail_fast:
+                log.exception("[%s] failed after %.1fs", name, elapsed)
                 raise
+            log.warning(
+                "[%s] failed after %.1fs: %s: %s",
+                name, elapsed, type(exc).__name__, exc,
+            )
+            log.debug("[%s] traceback", name, exc_info=exc)
             return idx, exc
         log.info("[%s] done in %.1fs", name, time.monotonic() - t0)
         return idx, value

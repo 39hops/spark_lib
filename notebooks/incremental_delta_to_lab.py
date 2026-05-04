@@ -28,6 +28,7 @@ spark.sql(f"CREATE DATABASE IF NOT EXISTS {LAB_DB}")
 spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
 # COMMAND ----------
+import json
 import logging
 from typing import Any, Dict, Iterable, List, Optional, Set, TypedDict, Union, cast
 
@@ -182,26 +183,31 @@ def table_exists(name: str) -> bool:
     return bool(spark.catalog.tableExists(name))
 
 
-def current_delta_version(path: str) -> int:
-    # `DeltaTable.forPath` is strict about URI form and rejects some otherwise-
-    # readable Delta folders (Synapse Link landing zones, trailing-slash quirks).
-    # Try `DESCRIBE HISTORY` first, then fall back to listing `_delta_log/`.
+def current_delta_version(path: str) -> Optional[int]:
+    # File-only lookup: cheap, avoids `DeltaTable.forPath` URI strictness and
+    # `DESCRIBE HISTORY` scans. `_last_checkpoint` (when present) names the
+    # latest committed version directly; otherwise list `_delta_log/` and take
+    # the max numeric `.json` commit. Returns None if neither is readable so
+    # callers can decide whether to keep going.
     p: str = path.rstrip("/")
+    log_dir: str = f"{p}/_delta_log"
     try:
-        row: Optional[Row] = spark.sql(f"DESCRIBE HISTORY delta.`{p}`").select("version").first()
-        if row is not None:
-            return int(row["version"])
+        cp_text: str = mssparkutils.fs.head(f"{log_dir}/_last_checkpoint", 4096)
+        version: Optional[int] = json.loads(cp_text).get("version")
+        if isinstance(version, int):
+            return version
     except Exception:
         pass
-    entries: List[Any] = list(mssparkutils.fs.ls(f"{p}/_delta_log"))
+    try:
+        entries: List[Any] = list(mssparkutils.fs.ls(log_dir))
+    except Exception:
+        return None
     versions: List[int] = [
         int(e.name.split(".")[0])
         for e in entries
         if e.name.endswith(".json") and e.name[0].isdigit()
     ]
-    if not versions:
-        raise ValueError(f"No Delta commits found at {path}")
-    return max(versions)
+    return max(versions) if versions else None
 
 
 def ensure_state_table() -> None:
@@ -343,11 +349,22 @@ def cdf_merge(
 def sync_table(spec: TableSpec) -> SyncResult:
     src_path: str = src_path_for(spec)
     dst_table: str = dst_table_for(spec)
-    current_version: int = current_delta_version(src_path)
+    current_version: Optional[int] = current_delta_version(src_path)
     last_version: Optional[int] = last_synced_version(spec)
 
+    # Snapshot path covers first runs and any source where we couldn't read a
+    # version. -1 marks "version unknown" so the next run will snapshot again
+    # rather than trusting a stale state row.
+    snapshot_version: int = current_version if current_version is not None else -1
+
     if last_version is None or not table_exists(dst_table):
-        return full_snapshot_merge(spec, src_path, dst_table, current_version)
+        return full_snapshot_merge(spec, src_path, dst_table, snapshot_version)
+    if current_version is None:
+        logger.warning(
+            "%s.%s: no readable Delta version at %s; doing snapshot merge",
+            spec["src_db"], spec["src_table"], src_path,
+        )
+        return full_snapshot_merge(spec, src_path, dst_table, snapshot_version)
     if last_version >= current_version:
         return sync_result(spec, dst_table, src_path, current_version, "already_current")
 
@@ -355,7 +372,10 @@ def sync_table(spec: TableSpec) -> SyncResult:
         return cdf_merge(spec, src_path, dst_table, last_version + 1, current_version)
     except Exception as exc:
         # Common reason: source table was not created with delta.enableChangeDataFeed=true.
-        logger.warning("CDF failed for %s.%s; falling back to snapshot merge: %s", spec["src_db"], spec["src_table"], exc)
+        logger.warning(
+            "%s.%s: CDF unavailable (%s), falling back to snapshot merge",
+            spec["src_db"], spec["src_table"], exc,
+        )
         return full_snapshot_merge(spec, src_path, dst_table, current_version)
 
 # COMMAND ----------
