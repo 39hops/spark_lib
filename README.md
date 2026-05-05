@@ -42,16 +42,16 @@ A lazy reference to a dataset. Format is inferred from the path extension; bare
 parquet/csv-style folders.
 
 ```python
-Input("abfss://raw@acct.dfs.core.windows.net/orders/")            # delta
-Input("abfss://raw@acct.dfs.core.windows.net/orders.csv")         # csv
-Input("abfss://raw@acct.dfs.core.windows.net/orders.xlsx")        # excel
-Input.table("sales.daily_orders")                                 # managed table
+Input("abfss://container@acct.dfs.core.windows.net/path/to/table/")   # delta
+Input("abfss://container@acct.dfs.core.windows.net/path/to/data.csv") # csv
+Input("abfss://container@acct.dfs.core.windows.net/path/to/data.xlsx")# excel
+Input.table("db.table")                                              # managed table
 ```
 
 Pass any reader options as kwargs:
 
 ```python
-Input("abfss://.../sales.csv", header="true", inferSchema="false", sep=",")
+Input("abfss://.../data.csv", header="true", inferSchema="false", sep=",")
 ```
 
 CSV reads default to `header="true"` and `inferSchema="false"` (set explicitly
@@ -63,12 +63,12 @@ A sink. Resolves the same way `Input` does. Outputs may not exist yet, so
 unmarked `abfss://` outputs default to delta without peeking.
 
 ```python
-Output("abfss://lab@acct.dfs.core.windows.net/sales/")            # delta path
-Output.table("sales.daily_orders")                                # managed delta
+Output("abfss://container@acct.dfs.core.windows.net/path/to/table/") # delta path
+Output.table("db.table")                                            # managed delta
 Output.table(
-    "sales.upserts",
+    "db.upserts",
     mode="merge",
-    merge_on=["order_id"],
+    merge_on=["id"],
 )                                                                  # delta upsert
 ```
 
@@ -82,17 +82,17 @@ from spark_lib import Input, Output, clean_columns, dedupe, transform_df
 
 
 @transform_df(
-    output=Output.table("sales.daily_orders", mode="overwrite"),
-    orders=Input("abfss://raw@acct.dfs.core.windows.net/orders/"),
-    customers=Input("abfss://raw@acct.dfs.core.windows.net/customers.csv"),
+    output=Output.table("db.output", mode="overwrite"),
+    left=Input("abfss://container@acct.dfs.core.windows.net/path/to/left/"),
+    right=Input("abfss://container@acct.dfs.core.windows.net/path/to/right.csv"),
 )
-def daily_orders(orders, customers):
-    joined = orders.join(customers, "customer_id")
+def compute(left, right):
+    joined = left.join(right, "fk_id")
     cleaned = clean_columns(joined)
-    return dedupe(cleaned, pks=["order_id"], order_by="updated_at")
+    return dedupe(cleaned, pks=["id"], order_by="updated_at")
 
 
-daily_orders()
+compute()
 ```
 
 `transform_df` is for one DataFrame in → one DataFrame out → write. Use the
@@ -131,7 +131,7 @@ unless `include_views=True`.
 ```python
 from spark_lib import drop_database_tables
 
-results = drop_database_tables("lab", max_workers=8)
+results = drop_database_tables("db", max_workers=8)
 failures = [r for r in results if isinstance(r, BaseException)]
 if failures:
     raise RuntimeError(f"{len(failures)} drops failed")
@@ -155,32 +155,33 @@ from spark_lib import (
     search_database,
 )
 
-hits = search_database("sales", "acme", limit_tables=20)
+hits = search_database("db", "abc", limit_tables=20)
 
 matches = fuzzy_match(
-    left=orders,
-    right=customers,
-    left_on="customer_name",
-    right_on="legal_name",
-    block_on="country",
+    left=left_df,
+    right=right_df,
+    left_on="value",
+    right_on="value_ref",
+    block_on="group",
     threshold=0.82,
 )
 
 filled = fill_missing_from_match(
-    left=orders,
-    right=customers,
-    left_on="customer_name",
-    right_on="legal_name",
-    fill_cols=["customer_id", "billing_city"],
-    block_on="country",
+    left=left_df,
+    right=right_df,
+    left_on="value",
+    right_on="value_ref",
+    fill_cols=["fk_id", "attr"],
+    block_on="group",
     threshold=0.82,
 )
 
 resolved = infer_key_from_text(
-    left=missing_ids,
-    reference=known_businesses,
-    key_col="business_id",
-    text_col="business_name",
+    left=left_df,
+    reference=right_df,
+    key_col="id",
+    text_col="value",
+    reference_text_col="value_ref",
     method="ml",
     threshold=0.84,
 )
@@ -190,7 +191,7 @@ resolved = infer_key_from_text(
   rows sharing the first two normalized characters to avoid a cross join.
 - `ml_fuzzy_match` and `infer_key_from_text(method="ml")` use PySpark ML
   `HashingTF` plus `MinHashLSH` over normalized character n-grams. Better
-  for business names ("Wal Mart" vs "Walmart").
+  for messy labels (`"a b c"` vs `"abc"`).
 - All matchers emit audit columns: matched right-side row, score, and
   distance — auditable, never silently trusted.
 
@@ -210,7 +211,7 @@ going.
 ```python
 from spark_lib.delta import current_delta_version
 
-v = current_delta_version("abfss://.../orders/")  # 137 or None
+v = current_delta_version("abfss://.../path/to/table/")  # 137 or None
 ```
 
 This intentionally avoids `DeltaTable.forPath` (URI-strict) and
@@ -225,7 +226,7 @@ exist.
 ```python
 from spark_lib.delta import snapshot_merge
 
-snapshot_merge("lab.orders", new_snapshot, on=["order_id"])
+snapshot_merge("db.table", new_snapshot, on=["id"])
 ```
 
 Set `delete_unmatched=False` for an upsert that does not delete rows missing
@@ -241,8 +242,8 @@ happened, `False` for an empty CDF window.
 ```python
 from spark_lib.delta import cdf_merge, read_cdf
 
-cdf = read_cdf("abfss://.../orders/", start_version=last + 1)
-applied = cdf_merge("lab.orders", cdf, on=["order_id"])
+cdf = read_cdf("abfss://.../path/to/table/", start_version=last + 1)
+applied = cdf_merge("db.table", cdf, on=["id"])
 ```
 
 ### `read_cdf(src_path, start_version) -> DataFrame`
@@ -253,11 +254,11 @@ Convenience wrapper around `spark.read.format("delta").option("readChangeFeed",
 ### `merge_condition(pks)` and `column_map(cols)`
 
 ```python
-merge_condition(["order_id", "tenant_id"])
-# -> "t.order_id = s.order_id AND t.tenant_id = s.tenant_id"
+merge_condition(["id", "fk_id"])
+# -> "t.id = s.id AND t.fk_id = s.fk_id"
 
-column_map(["order_id", "amount"])
-# -> {"order_id": "s.order_id", "amount": "s.amount"}
+column_map(["id", "value"])
+# -> {"id": "s.id", "value": "s.value"}
 ```
 
 ---
@@ -274,15 +275,15 @@ from spark_lib.sync import SyncSpec, SyncState, run_sync
 
 specs: list[SyncSpec] = [
     {
-        "src_key":   "sales.orders",
-        "src_path":  "abfss://raw@acct.dfs.core.windows.net/SALES/ORDERS/1.2/",
-        "dst_table": "lab.orders",
-        "pks":       ["order_id"],
+        "src_key":   "src.table",
+        "src_path":  "abfss://container@acct.dfs.core.windows.net/SRC/TABLE/1.2/",
+        "dst_table": "db.table",
+        "pks":       ["id"],
     },
     # ... more specs
 ]
 
-state = SyncState("lab.__spark_lib_delta_sync_state")
+state = SyncState("db.__spark_lib_delta_sync_state")
 successes, failures = run_sync(specs, state, max_workers=8, pool="delta_sync")
 ```
 

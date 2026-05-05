@@ -68,8 +68,8 @@ def merge_condition(
         A single SQL string of the form ``"t.k1 = s.k1 AND t.k2 = s.k2"``.
 
     Example:
-        >>> merge_condition(["order_id", "tenant_id"])
-        't.order_id = s.order_id AND t.tenant_id = s.tenant_id'
+        >>> merge_condition(["id", "fk_id"])
+        't.id = s.id AND t.fk_id = s.fk_id'
     """
     return " AND ".join(
         f"{target_alias}.{c} = {source_alias}.{c}" for c in pks
@@ -91,8 +91,8 @@ def column_map(cols: Iterable[str], prefix: str = "s") -> Dict[str, str]:
         A dict mapping each column name to a SQL expression string.
 
     Example:
-        >>> column_map(["order_id", "amount"])
-        {'order_id': 's.order_id', 'amount': 's.amount'}
+        >>> column_map(["id", "value"])
+        {'id': 's.id', 'value': 's.value'}
     """
     return {c: f"{prefix}.{c}" for c in cols}
 
@@ -120,7 +120,7 @@ def current_delta_version(path: str) -> Optional[int]:
         (folder unreadable, no ``_delta_log``, or notebookutils unavailable).
 
     Example:
-        >>> v = current_delta_version("abfss://raw@acct.../orders/")
+        >>> v = current_delta_version("abfss://container@acct.../path/to/table/")
         >>> if v is None:
         ...     # treat as snapshot
         ...     ...
@@ -164,7 +164,7 @@ def snapshot_merge(
 
     Args:
         target_table: Fully-qualified managed Delta table name
-            (e.g. ``"lab.orders"``).
+            (e.g. ``"db.table"``).
         df: Source DataFrame to merge in. Should already be normalized
             (e.g. column names matched to the target).
         on: Primary key columns used for the merge predicate.
@@ -176,8 +176,8 @@ def snapshot_merge(
         ``None``. The merge is executed in-place on the Delta target.
 
     Example:
-        >>> snapshot_merge("lab.orders", new_snapshot, on=["order_id"])
-        >>> snapshot_merge("lab.orders", upserts, on=["order_id"],
+        >>> snapshot_merge("db.table", new_snapshot, on=["id"])
+        >>> snapshot_merge("db.table", upserts, on=["id"],
         ...                delete_unmatched=False)
     """
     from delta.tables import DeltaTable
@@ -236,8 +236,8 @@ def cdf_merge(
         enabled on the source table, or columns are missing.
 
     Example:
-        >>> cdf = read_cdf("abfss://raw@acct.../orders/", start_version=last + 1)
-        >>> applied = cdf_merge("lab.orders", cdf, on=["order_id"])
+        >>> cdf = read_cdf("abfss://container@acct.../path/to/table/", start_version=last + 1)
+        >>> applied = cdf_merge("db.table", cdf, on=["id"])
     """
     from delta.tables import DeltaTable
     from pyspark.sql import Window
@@ -295,7 +295,7 @@ def read_cdf(src_path: str, start_version: int) -> "DataFrame":
         enabled on the source.
 
     Example:
-        >>> cdf = read_cdf("abfss://raw@acct.../orders/", start_version=42)
+        >>> cdf = read_cdf("abfss://container@acct.../path/to/table/", start_version=42)
         >>> cdf.show()
     """
     spark = get_spark()

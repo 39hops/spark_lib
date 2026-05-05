@@ -58,7 +58,18 @@ _NOISY_LOGGERS: List[str] = [
 
 
 def quiet_azure_logging(level: int = logging.WARNING) -> None:
-    """Raise noisy Azure and py4j loggers above normal notebook chatter."""
+    """Raise noisy Azure and py4j loggers above normal notebook chatter.
+
+    Examples:
+        Default — silence to WARNING:
+
+        >>> quiet_azure_logging()
+
+        Silence harder — only show errors:
+
+        >>> import logging
+        >>> quiet_azure_logging(level=logging.ERROR)
+    """
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(level)
     log.info(
@@ -87,7 +98,32 @@ def _to_snake(name: str) -> str:
 
 
 def clean_columns(df: "DataFrame") -> "DataFrame":
-    """Rename every column to snake_case ASCII with collision suffixes."""
+    """Rename every column to snake_case ASCII with collision suffixes.
+
+    Strips accents, lowercases, replaces non-alphanumeric runs with ``_``,
+    prepends ``_`` to names that would start with a digit, and disambiguates
+    duplicate normalized names by appending ``_1``, ``_2``, ...
+
+    Examples:
+        >>> df.columns
+        ['ID', 'Value ($)', 'Façade']
+        >>> clean_columns(df).columns
+        ['id', 'value', 'facade']
+
+        Duplicates get suffixed:
+
+        >>> df2.columns
+        ['name', 'Name']
+        >>> clean_columns(df2).columns
+        ['name', 'name_1']
+
+        Leading digits are escaped:
+
+        >>> df3.columns
+        ['1st_quarter']
+        >>> clean_columns(df3).columns
+        ['_1st_quarter']
+    """
     seen: Dict[str, int] = {}
     new_names: List[str] = []
     changed: int = 0
@@ -113,7 +149,26 @@ def dedupe(
     order_by: Union[str, Iterable[str]],
     descending: bool = True,
 ) -> "DataFrame":
-    """Keep one row per primary-key group, picked by `order_by`."""
+    """Keep one row per primary-key group, picked by ``order_by``.
+
+    Implemented with ``row_number()`` over a window partitioned by ``pks``
+    and ordered by ``order_by``. By default ``descending=True`` so the
+    "latest" row wins for timestamp-style ordering keys.
+
+    Examples:
+        Latest row per ``id`` by ``updated_at``:
+
+        >>> dedupe(df, pks="id", order_by="updated_at")
+
+        Composite PK, multi-column ordering:
+
+        >>> dedupe(df, pks=["id", "fk_id"],
+        ...       order_by=["updated_at", "version"])
+
+        Earliest row instead of latest:
+
+        >>> dedupe(df, pks="id", order_by="created_at", descending=False)
+    """
     from pyspark.sql import Window
     from pyspark.sql import functions as F
 
@@ -148,7 +203,29 @@ def run_parallel(
     pool: Optional[str] = None,
     fail_fast: bool = False,
 ) -> List[Union[T, BaseException]]:
-    """Run `fn(**job)` for every job concurrently via ThreadPoolExecutor."""
+    """Run ``fn(**job)`` for every job concurrently via ``ThreadPoolExecutor``.
+
+    Each job is a dict whose keys map to ``fn``'s keyword arguments. An
+    optional ``"name"`` key is used in log lines. Failures are returned as
+    exception objects in the result list (not raised), unless
+    ``fail_fast=True`` in which case the first failure cancels the rest.
+
+    Examples:
+        Run a function across many inputs:
+
+        >>> def load(name, db, **_):
+        ...     return spark.read.table(f"{db}.{name}").count()
+        >>> jobs = [{"name": t, "db": "db"} for t in ["table_a", "table_b"]]
+        >>> results = run_parallel(load, jobs, max_workers=4)
+
+        Use a Spark FAIR pool so the parallel work has its own scheduling lane:
+
+        >>> run_parallel(load, jobs, max_workers=8, pool="ingest")
+
+        Fail-fast variant (first exception cancels remaining work):
+
+        >>> run_parallel(load, jobs, fail_fast=True)
+    """
     sc: Any = get_spark().sparkContext
     results: List[Any] = [None] * len(jobs)
 
@@ -219,6 +296,23 @@ def drop_database_tables(
     Returns:
         Ordered ``List[str | BaseException]`` matching :func:`run_parallel`.
         Successful entries are fully-qualified object names.
+
+    Examples:
+        Drop everything in a database:
+
+        >>> drop_database_tables("db")
+
+        Drop only specific tables, including views:
+
+        >>> drop_database_tables(
+        ...     "db",
+        ...     tables=["table_a", "table_b"],
+        ...     include_views=True,
+        ... )
+
+        Preview without executing:
+
+        >>> drop_database_tables("db", dry_run=True)
     """
     spark: Any = get_spark()
     selected: Optional[Set[str]] = set(tables) if tables is not None else None

@@ -1,6 +1,7 @@
 """Importable package for Synapse notebook transform helpers."""
 from __future__ import annotations
 
+from .catalog import scan_databases, write_dictionary
 from .cleanup import (
     clean_columns,
     dedupe,
@@ -26,13 +27,23 @@ from .matching import (
     search_database,
 )
 from .session import get_spark, set_spark
-from .sync import SyncResult, SyncSpec, SyncState, run_sync, sync_delta_to_table
+from .sync import (
+    SyncAudit,
+    SyncAuditRow,
+    SyncResult,
+    SyncSpec,
+    SyncState,
+    run_sync,
+    sync_delta_to_table,
+)
 from .transforms import Input, Output, transform, transform_df
 
 __all__ = [
     "DEFAULT_CDF_METADATA",
     "Input",
     "Output",
+    "SyncAudit",
+    "SyncAuditRow",
     "SyncResult",
     "SyncSpec",
     "SyncState",
@@ -53,10 +64,12 @@ __all__ = [
     "read_cdf",
     "run_parallel",
     "run_sync",
+    "scan_databases",
     "search_database",
     "set_spark",
     "snapshot_merge",
     "sync_delta_to_table",
     "transform",
     "transform_df",
+    "write_dictionary",
 ]

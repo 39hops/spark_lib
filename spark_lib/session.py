@@ -19,6 +19,17 @@ def set_spark(session: "SparkSession") -> None:
     Use this in local scripts/tests or any runtime where Spark does not expose
     an active session. Synapse notebooks usually do not need it because Spark is
     already active before user code runs.
+
+    Examples:
+        In a Synapse notebook (rarely needed):
+
+        >>> from spark_lib import set_spark
+        >>> set_spark(spark)
+
+        In a local script:
+
+        >>> from pyspark.sql import SparkSession
+        >>> set_spark(SparkSession.builder.getOrCreate())
     """
     global _spark
     _spark = session
@@ -29,6 +40,16 @@ def get_spark() -> "SparkSession":
 
     This intentionally avoids `SparkSession.builder.getOrCreate()` so imports
     do not mutate the runtime or fight Synapse's pre-created session.
+
+    Examples:
+        >>> spark = get_spark()
+        >>> spark.sql("SELECT 1").collect()
+        [Row(1=1)]
+
+        Used internally by every reader/writer in this package:
+
+        >>> def my_helper():
+        ...     return get_spark().table("db.table").count()
     """
     if _spark is not None:
         return _spark

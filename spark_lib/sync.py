@@ -1,7 +1,7 @@
 """Incremental Delta sync into managed Delta tables.
 
 This module turns a list of source-Delta-folders into a list of
-managed Delta tables in a lab database, deciding per-source whether to do
+managed Delta tables in a target database, deciding per-source whether to do
 a full snapshot or an incremental Change Data Feed merge based on a tiny
 state table.
 
@@ -43,7 +43,7 @@ Typical usage
     from spark_lib.sync import SyncSpec, SyncState, run_sync
 
     specs: list[SyncSpec] = [...]
-    state = SyncState("lab.__spark_lib_delta_sync_state")
+    state = SyncState("db.__spark_lib_delta_sync_state")
     successes, failures = run_sync(specs, state, max_workers=8)
 """
 from __future__ import annotations
@@ -81,13 +81,21 @@ class SyncSpec(TypedDict, total=False):
     """Description of one source to sync.
 
     Fields:
-        src_key: Stable identifier, e.g. ``"sales.orders"``. Used as the
+        src_key: Stable identifier, e.g. ``"src.table"``. Used as the
             primary key in the state table.
         src_path: Source Delta folder URI (typically ``abfss://...``).
         dst_table: Fully-qualified managed Delta table to write into,
-            e.g. ``"lab.orders"``.
+            e.g. ``"db.table"``.
         pks: Primary key column names. Used for the merge predicate and for
             deduplicating CDF rows per key.
+
+    Example:
+        >>> spec: SyncSpec = {
+        ...     "src_key": "src.table",
+        ...     "src_path": "abfss://container@acct.../SRC/TABLE/1.2/",
+        ...     "dst_table": "db.table",
+        ...     "pks": ["id"],
+        ... }
     """
     src_key: str
     src_path: str
@@ -107,12 +115,146 @@ class SyncResult(TypedDict):
             next run will re-snapshot rather than trust this row).
         sync_mode: One of ``"initial_snapshot"``, ``"snapshot_merge"``,
             ``"already_current"``, ``"cdf_merge"``, ``"cdf_noop"``.
+
+    Example:
+        >>> result: SyncResult = {
+        ...     "src_key": "src.table",
+        ...     "src_path": "abfss://...",
+        ...     "dst_table": "db.table",
+        ...     "last_delta_version": 42,
+        ...     "sync_mode": "cdf_merge",
+        ... }
     """
     src_key: str
     src_path: str
     dst_table: str
     last_delta_version: int
     sync_mode: str
+
+
+_WROTE_MODES: Set[str] = {"initial_snapshot", "snapshot_merge", "cdf_merge"}
+
+
+class SyncAuditRow(TypedDict):
+    """One row appended to the audit table per attempted sync.
+
+    Fields:
+        src_key, src_path, dst_table, sync_mode, last_delta_version: copied
+            from the corresponding :class:`SyncResult`.
+        rows_inserted, rows_updated, rows_deleted, rows_output: pulled from
+            ``operationMetrics`` of the latest Delta commit on ``dst_table``.
+            Zero for modes that did not write (``already_current``, ``cdf_noop``).
+
+    Example:
+        >>> row: SyncAuditRow = {
+        ...     "src_key": "src.table", "src_path": "abfss://...",
+        ...     "dst_table": "db.table", "sync_mode": "cdf_merge",
+        ...     "last_delta_version": 42,
+        ...     "rows_inserted": 100, "rows_updated": 5,
+        ...     "rows_deleted": 0, "rows_output": 105,
+        ... }
+    """
+    src_key: str
+    src_path: str
+    dst_table: str
+    sync_mode: str
+    last_delta_version: int
+    rows_inserted: int
+    rows_updated: int
+    rows_deleted: int
+    rows_output: int
+
+
+@dataclass
+class SyncAudit:
+    """Append-only audit log of sync runs.
+
+    Backed by a managed Delta table; each call to :meth:`append` adds one row
+    per :class:`SyncResult`. Row counts come from Delta's ``operationMetrics``
+    on the latest commit of ``dst_table`` — no extra data scan.
+
+    Why a separate table from :class:`SyncState`: state is upsert-keyed by
+    ``src_key`` (one row per source) and tells the next run where to resume;
+    audit is append-only history for diagnosing silent merge bugs after the
+    fact. They have different retention and access patterns.
+
+    Attributes:
+        table: Fully-qualified managed Delta audit table, e.g.
+            ``"db.__sync_audit"``.
+
+    Example:
+        >>> audit = SyncAudit("db.__sync_audit")
+        >>> successes, failures = run_sync(specs, state, audit=audit)
+        >>> spark.table("db.__sync_audit").orderBy("audited_at", ascending=False).show()
+    """
+    table: str
+
+    def ensure(self) -> None:
+        """Create the audit table if it doesn't exist.
+
+        Idempotent: returns immediately if the table is already registered.
+        Called automatically by :func:`run_sync` when an ``audit`` is passed.
+
+        Example:
+            >>> SyncAudit("db.__sync_audit").ensure()
+        """
+        spark = get_spark()
+        if spark.catalog.tableExists(self.table):
+            return
+        from pyspark.sql.types import (
+            LongType, StringType, StructField, StructType, TimestampType,
+        )
+        schema = StructType([
+            StructField("src_key", StringType(), False),
+            StructField("src_path", StringType(), False),
+            StructField("dst_table", StringType(), False),
+            StructField("sync_mode", StringType(), False),
+            StructField("last_delta_version", LongType(), False),
+            StructField("rows_inserted", LongType(), False),
+            StructField("rows_updated", LongType(), False),
+            StructField("rows_deleted", LongType(), False),
+            StructField("rows_output", LongType(), False),
+            StructField("audited_at", TimestampType(), False),
+        ])
+        (
+            spark.createDataFrame([], schema)
+                 .write.format("delta").mode("overwrite")
+                 .saveAsTable(self.table)
+        )
+        log.info("created sync audit table %s", self.table)
+
+    def append(self, results: List[SyncResult]) -> List[SyncAuditRow]:
+        """Append one audit row per ``SyncResult`` to the audit table.
+
+        For each result whose ``sync_mode`` actually wrote, reads the latest
+        commit's ``operationMetrics`` from ``DESCRIBE HISTORY``. For no-op
+        modes (``already_current``, ``cdf_noop``) all row counts are ``0``.
+
+        Args:
+            results: Successful sync results to record. Empty list is a no-op.
+
+        Returns:
+            The audit rows that were written, in input order.
+
+        Example:
+            >>> audit = SyncAudit("db.__sync_audit")
+            >>> audit.ensure()
+            >>> audit.append(successes)
+        """
+        if not results:
+            return []
+        from pyspark.sql import functions as F
+
+        spark = get_spark()
+        rows: List[SyncAuditRow] = [
+            _build_audit_row(r) for r in results
+        ]
+        df = (
+            spark.createDataFrame([dict(r) for r in rows])
+                 .withColumn("audited_at", F.current_timestamp())
+        )
+        df.write.format("delta").mode("append").saveAsTable(self.table)
+        return rows
 
 
 @dataclass
@@ -124,7 +266,7 @@ class SyncState:
 
     Attributes:
         table: Fully-qualified managed Delta table name, e.g.
-            ``"lab.__spark_lib_delta_sync_state"``.
+            ``"db.__spark_lib_delta_sync_state"``.
 
     Methods at a glance:
         ensure(): Create the state table if it does not exist.
@@ -132,6 +274,11 @@ class SyncState:
         load_all(): Read the entire state table into a dict.
         upsert(result): Apply one ``SyncResult`` row.
         upsert_all(results): Apply many ``SyncResult`` rows in one MERGE.
+
+    Example:
+        >>> state = SyncState("db.__spark_lib_delta_sync_state")
+        >>> state.ensure()
+        >>> last = state.get("src.table")
     """
     table: str
 
@@ -140,6 +287,9 @@ class SyncState:
 
         Writes an empty Delta table with the standard sync-state schema.
         Idempotent: returns immediately if the table is already registered.
+
+        Example:
+            >>> SyncState("db.__spark_lib_delta_sync_state").ensure()
         """
         spark = get_spark()
         if spark.catalog.tableExists(self.table):
@@ -175,6 +325,10 @@ class SyncState:
         Note:
             Prefer :meth:`load_all` when you're about to look up many keys —
             this method runs a small Spark query each call.
+
+        Example:
+            >>> state.get("src.table")
+            42
         """
         spark = get_spark()
         if not spark.catalog.tableExists(self.table):
@@ -198,6 +352,11 @@ class SyncState:
         Returns:
             ``{src_key: last_delta_version}`` for every row in the state
             table, or an empty dict if the table doesn't exist yet.
+
+        Example:
+            >>> versions = state.load_all()
+            >>> versions.get("src.table")
+            42
         """
         spark = get_spark()
         if not spark.catalog.tableExists(self.table):
@@ -214,6 +373,9 @@ class SyncState:
 
         Convenience wrapper around :meth:`upsert_all`. Each call is a Delta
         transaction; prefer :meth:`upsert_all` when writing many results.
+
+        Example:
+            >>> state.upsert(result)
         """
         self.upsert_all([result])
 
@@ -231,6 +393,9 @@ class SyncState:
             One MERGE has fixed commit overhead, so batching many results
             into a single call is meaningfully faster than calling
             :meth:`upsert` in a loop.
+
+        Example:
+            >>> state.upsert_all(successes)
         """
         if not results:
             return
@@ -301,10 +466,10 @@ def sync_delta_to_table(
 
     Example:
         >>> result = sync_delta_to_table(
-        ...     src_key="sales.orders",
-        ...     src_path="abfss://raw@acct.../SALES/ORDERS/1.2/",
-        ...     dst_table="lab.orders",
-        ...     pks=["order_id"],
+        ...     src_key="src.table",
+        ...     src_path="abfss://container@acct.../SRC/TABLE/1.2/",
+        ...     dst_table="db.table",
+        ...     pks=["id"],
         ...     state=state,
         ... )
         >>> state.upsert(result)
@@ -380,6 +545,7 @@ def run_sync(
     max_workers: int = 4,
     pool: Optional[str] = None,
     cdf_metadata_cols: Set[str] = DEFAULT_CDF_METADATA,
+    audit: Optional[SyncAudit] = None,
 ) -> Tuple[List[SyncResult], List[BaseException]]:
     """Run :func:`sync_delta_to_table` for many specs in parallel.
 
@@ -398,6 +564,11 @@ def run_sync(
         pool: If given, set ``spark.scheduler.pool`` on each worker thread.
             Requires Spark FAIR scheduling configured at session start.
         cdf_metadata_cols: Forwarded to :func:`sync_delta_to_table`.
+        audit: Optional :class:`SyncAudit` to append a row per success.
+            When given, ``audit.ensure()`` is called and one row per
+            successful sync is appended with row counts pulled from the
+            target's latest commit metrics. Off by default — opt in by
+            passing ``audit=SyncAudit("db.__sync_audit")``.
 
     Returns:
         ``(successes, failures)``. Both lists preserve spec order on the
@@ -406,7 +577,7 @@ def run_sync(
 
     Example:
         >>> specs = load_specs(...)
-        >>> state = SyncState("lab.__spark_lib_delta_sync_state")
+        >>> state = SyncState("db.__spark_lib_delta_sync_state")
         >>> successes, failures = run_sync(
         ...     specs, state, max_workers=8, pool="delta_sync",
         ... )
@@ -458,10 +629,53 @@ def run_sync(
     ]
     # One MERGE for all state writes instead of one transaction per success.
     state.upsert_all(successes)
+    if audit is not None:
+        audit.ensure()
+        audit.append(successes)
     log.info(
         "run_sync: %d succeeded, %d failed", len(successes), len(failures),
     )
     return successes, failures
+
+
+def _build_audit_row(result: SyncResult) -> SyncAuditRow:
+    mode: str = result["sync_mode"]
+    if mode in _WROTE_MODES:
+        metrics = _read_last_metrics(result["dst_table"])
+    else:
+        metrics = {}
+    return {
+        "src_key": result["src_key"],
+        "src_path": result["src_path"],
+        "dst_table": result["dst_table"],
+        "sync_mode": mode,
+        "last_delta_version": int(result["last_delta_version"]),
+        "rows_inserted": int(metrics.get("numTargetRowsInserted", 0)),
+        "rows_updated": int(metrics.get("numTargetRowsUpdated", 0)),
+        "rows_deleted": int(metrics.get("numTargetRowsDeleted", 0)),
+        "rows_output": int(metrics.get("numOutputRows", 0)),
+    }
+
+
+def _read_last_metrics(dst_table: str) -> Dict[str, str]:
+    """Pull ``operationMetrics`` of the most recent commit on ``dst_table``.
+
+    Returns an empty dict on any failure — audit rows still get written with
+    zero counts rather than blowing up the run.
+    """
+    spark = get_spark()
+    try:
+        row = (
+            spark.sql(f"DESCRIBE HISTORY {dst_table} LIMIT 1")
+                 .select("operationMetrics")
+                 .first()
+        )
+    except Exception as exc:
+        log.debug("could not read history for %s: %s", dst_table, exc)
+        return {}
+    if row is None or row["operationMetrics"] is None:
+        return {}
+    return dict(row["operationMetrics"])
 
 
 def _result(
@@ -481,6 +695,8 @@ def _result(
 
 
 __all__: List[str] = [
+    "SyncAudit",
+    "SyncAuditRow",
     "SyncResult",
     "SyncSpec",
     "SyncState",

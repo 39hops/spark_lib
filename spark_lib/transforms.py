@@ -150,7 +150,39 @@ def _nbutils() -> Any:
 
 @dataclass(init=False)
 class Input:
-    """A lazy reference to a dataset. Call `.dataframe()` to materialize."""
+    """A lazy reference to a dataset. Call `.dataframe()` to materialize.
+
+    Format is resolved by:
+
+    1. ``format=`` argument if given.
+    2. File extension if the path has one (``.csv``, ``.parquet``, ``.delta``...).
+    3. Peeking the abfss directory for ``_delta_log`` or a ``part-*`` file.
+    4. Defaulting to ``"delta"``.
+
+    Examples:
+        Read a Delta folder (format inferred from ``_delta_log`` peek):
+
+        >>> source = Input("abfss://container@acct.../path/to/table/")
+        >>> df = source.dataframe()
+
+        Read a registered managed table:
+
+        >>> table = Input.table("db.table")
+        >>> df = table.dataframe()
+
+        Read a CSV with non-default options (forwarded to the reader):
+
+        >>> source = Input(
+        ...     "abfss://.../data.csv",
+        ...     format="csv",
+        ...     header="true",
+        ...     inferSchema="true",
+        ... )
+
+        Force a format (e.g. JSON folder without ``.json`` extension):
+
+        >>> source = Input("abfss://.../path/to/data/", format="json")
+    """
 
     path: PathLike
     format: Optional[str] = None
@@ -169,6 +201,12 @@ class Input:
 
     @classmethod
     def table(cls, name: str, **options: Any) -> "Input":
+        """Construct an :class:`Input` that reads a registered managed table.
+
+        Examples:
+            >>> Input.table("db.table").dataframe()
+            >>> Input.table("db.table").read().filter("value > 0")
+        """
         return cls(path=name, format="table", **options)
 
     @property
@@ -177,6 +215,14 @@ class Input:
 
         Cached so repeated reads (or `inp.fmt` accessed for logging then
         reading) do not trigger multiple `fs.ls` calls.
+
+        Examples:
+            >>> Input("data.csv").fmt
+            'csv'
+            >>> Input("abfss://.../path/to/table/").fmt   # peeks once
+            'delta'
+            >>> Input("db.table", format="table").fmt
+            'table'
         """
         if self._resolved_fmt is not None:
             return self._resolved_fmt
@@ -192,6 +238,14 @@ class Input:
         return self._resolved_fmt
 
     def dataframe(self) -> "DataFrame":
+        """Materialize this input as a Spark DataFrame.
+
+        Examples:
+            >>> Input.table("db.table").dataframe().count()
+            1234
+            >>> Input("abfss://.../path/to/table/").dataframe().columns
+            ['id', 'value', 'updated_at']
+        """
         spark = get_spark()
         fmt: str = self.fmt
 
@@ -214,6 +268,11 @@ class Input:
         return reader.load(self.path)
 
     def read(self) -> "DataFrame":
+        """Alias for :meth:`dataframe` matching the foundry transforms API.
+
+        Example:
+            >>> df = Input("abfss://.../path/to/table/").read()
+        """
         return self.dataframe()
 
 
@@ -221,7 +280,31 @@ class Input:
 
 @dataclass(init=False)
 class Output:
-    """A sink. Call `.write(df)` or use a `@transform_df` decorator."""
+    """A sink. Call `.write(df)` or use a `@transform_df` decorator.
+
+    Examples:
+        Write a DataFrame to a managed Delta table (default):
+
+        >>> out = Output.table("db.table")
+        >>> out.write(df)
+
+        Write to abfss as Parquet, partitioned:
+
+        >>> Output(
+        ...     "abfss://container@acct.../path/to/table/",
+        ...     format="parquet",
+        ...     mode="overwrite",
+        ...     partition_by="group",
+        ... ).write(df)
+
+        Upsert via Delta MERGE on a managed table:
+
+        >>> Output.table("db.table", mode="merge", merge_on="id").write(df)
+
+        Write multiple sheets to one .xlsx file:
+
+        >>> Output("abfss://.../report.xlsx").write({"a": df1, "b": df2})
+    """
 
     path: PathLike
     format: Optional[str] = None
@@ -260,6 +343,14 @@ class Output:
         merge_on: Optional[PartitionLike] = None,
         **options: Any,
     ) -> "Output":
+        """Construct an :class:`Output` that writes to a registered managed table.
+
+        Examples:
+            >>> Output.table("db.table")
+            >>> Output.table("db.table", mode="append")
+            >>> Output.table("db.table", mode="merge", merge_on=["id"])
+            >>> Output.table("db.table", partition_by="group")
+        """
         return cls(
             path=name,
             format="table",
@@ -276,10 +367,44 @@ class Output:
 
         Outputs may not exist yet, so an unmarked `abfss://` path defaults to
         delta instead of trying to inspect the destination.
+
+        Examples:
+            >>> Output("out.csv").fmt
+            'csv'
+            >>> Output("abfss://.../folder/").fmt
+            'delta'
+            >>> Output.table("db.table").fmt
+            'table'
         """
         return self.format or _infer_format(self.path) or "delta"
 
     def write(self, df: WriteData) -> None:
+        """Write ``df`` to this sink.
+
+        Routes to the right code path based on ``self.mode`` and ``self.fmt``:
+
+        - ``mode="merge"`` → :meth:`merge_into` using ``merge_on``.
+        - ``fmt == "excel"`` → driver-side xlsx via pandas.
+        - ``fmt == "table"`` → ``saveAsTable`` with ``table_format``.
+        - otherwise → ``df.write.format(fmt).mode(mode).save(path)``.
+
+        Examples:
+            Overwrite a managed Delta table:
+
+            >>> Output.table("db.table").write(df)
+
+            Append to an abfss Parquet folder:
+
+            >>> Output("abfss://.../path/to/table/", format="parquet", mode="append").write(df)
+
+            Merge upsert by key:
+
+            >>> Output.table("db.table", mode="merge", merge_on="id").write(df)
+
+            Multi-sheet Excel report:
+
+            >>> Output("abfss://.../report.xlsx").write({"a": df1, "b": df2})
+        """
         fmt: str = self.fmt
 
         if self.mode == "merge":
@@ -321,6 +446,11 @@ class Output:
         writer.save(self.path)
 
     def write_dataframe(self, df: WriteData) -> None:
+        """Alias for :meth:`write` matching the foundry transforms API.
+
+        Example:
+            >>> Output.table("db.table").write_dataframe(df)
+        """
         self.write(df)
 
     def merge_into(
@@ -330,7 +460,27 @@ class Output:
         when_matched_update: bool = True,
         when_not_matched_insert: bool = True,
     ) -> None:
-        """Delta MERGE upsert by key(s). Target must already exist."""
+        """Delta MERGE upsert by key(s). Target must already exist.
+
+        Examples:
+            Single-key upsert:
+
+            >>> Output.table("db.table").merge_into(df, on="id")
+
+            Composite key:
+
+            >>> Output.table("db.table").merge_into(df, on=["id", "fk_id"])
+
+            Insert-only (no updates on existing rows):
+
+            >>> Output.table("db.audit").merge_into(
+            ...     df, on="id", when_matched_update=False,
+            ... )
+
+            Path-based target:
+
+            >>> Output("abfss://.../path/to/table/").merge_into(df, on="id")
+        """
         from delta.tables import DeltaTable
 
         spark = get_spark()
@@ -408,7 +558,42 @@ def transform_df(
     output: Output,
     **inputs: Input,
 ) -> Callable[[TransformDFFn], RunDFFn]:
-    """Compute fn returns data, then writes it to `output`."""
+    """Decorator: function returns data, the wrapper writes it to ``output``.
+
+    The decorated function receives one DataFrame per ``inputs`` keyword
+    argument. Its return value is written via ``output.write``. Calling the
+    wrapper executes the whole transform.
+
+    Examples:
+        Single input, single output:
+
+        >>> @transform_df(
+        ...     output=Output.table("db.output"),
+        ...     source=Input.table("db.input"),
+        ... )
+        ... def clean(source):
+        ...     return source.where("value > 0")
+        >>> clean()  # reads, transforms, writes
+
+        Multi-input join:
+
+        >>> @transform_df(
+        ...     output=Output.table("db.output"),
+        ...     left=Input.table("db.left"),
+        ...     right=Input.table("db.right"),
+        ... )
+        ... def enrich(left, right):
+        ...     return left.join(right, on="fk_id")
+
+        Multi-sheet Excel report:
+
+        >>> @transform_df(
+        ...     output=Output("abfss://.../report.xlsx"),
+        ...     source=Input.table("db.input"),
+        ... )
+        ... def report(source):
+        ...     return {"data": source, "by_group": source.groupBy("group").count()}
+    """
     _validate(output, inputs)
 
     def deco(fn: TransformDFFn) -> RunDFFn:
@@ -440,7 +625,37 @@ def transform(
     outputs: Optional[Mapping[str, Output]] = None,
     **inputs: Input,
 ) -> Callable[[TransformFn], RunFn]:
-    """Lower-level decorator that passes raw Input and Output objects."""
+    """Lower-level decorator that passes raw :class:`Input`/:class:`Output` objects.
+
+    Use this when the function needs to drive reads and writes itself — e.g.
+    streaming, conditional sinks, or multiple writes from one body. Unlike
+    :func:`transform_df`, the decorator does not call ``write`` for you.
+
+    Examples:
+        Single output, manual write:
+
+        >>> @transform(
+        ...     output=Output.table("db.output"),
+        ...     source=Input.table("db.input"),
+        ... )
+        ... def go(source, output):
+        ...     output.write(source.dataframe().where("value > 0"))
+        >>> go()
+
+        Multiple outputs:
+
+        >>> @transform(
+        ...     outputs={
+        ...         "matched": Output.table("db.matched"),
+        ...         "unmatched": Output.table("db.unmatched"),
+        ...     },
+        ...     source=Input.table("db.input"),
+        ... )
+        ... def split(source, matched, unmatched):
+        ...     df = source.dataframe()
+        ...     matched.write(df.where("value > 0"))
+        ...     unmatched.write(df.where("value <= 0"))
+    """
     if output is not None and outputs is not None:
         raise ValueError("Pass either `output=` or `outputs=`, not both.")
 

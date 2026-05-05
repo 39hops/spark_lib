@@ -43,6 +43,22 @@ def normalize_text(col: Union[str, "Column"]) -> "Column":
     The expression is Spark-native: no Python UDF, no driver collect. It
     lowercases, transliterates common accents, removes punctuation, and
     collapses whitespace.
+
+    Examples:
+        Pass a column name:
+
+        >>> df.withColumn("value_norm", normalize_text("value")).show()
+
+        Or pass a Column expression for chained transforms:
+
+        >>> from pyspark.sql import functions as F
+        >>> df.withColumn("clean", normalize_text(F.upper(F.col("value"))))
+
+        Sample inputs and outputs::
+
+            "Café Au Lait!"   → "cafe au lait"
+            "  O'Brien's "    → "o brien s"
+            None              → ""
     """
     from pyspark.sql import functions as F
 
@@ -69,6 +85,24 @@ def search_database(
     This intentionally scans only string columns. It performs actions
     (`count`, `collect` for samples), so use `tables=` or `limit_tables=` when
     exploring large schemas.
+
+    Examples:
+        Find every string column in ``db`` containing ``"abc"``:
+
+        >>> search_database("db", "abc").show(truncate=False)
+
+        Restrict to specific tables and columns:
+
+        >>> search_database(
+        ...     "db", "abc",
+        ...     tables=["table_a", "table_b"],
+        ...     columns=["value", "alt_value"],
+        ...     case_sensitive=True,
+        ... )
+
+        Cap the scan when exploring a wide database:
+
+        >>> search_database("db", "abc", limit_tables=10, sample_rows=3)
     """
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
@@ -158,6 +192,32 @@ def fuzzy_match(
     This path is transparent and easy to reason about. Without `block_on`, it
     joins only rows with the same first two normalized characters to avoid a
     full cross join.
+
+    Examples:
+        Match values against a reference list:
+
+        >>> matches = fuzzy_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     threshold=0.85,
+        ... )
+        >>> matches.select("left_value", "right_value", "match_score").show()
+
+        Block by a grouping column so only comparable rows are joined:
+
+        >>> fuzzy_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     block_on="group", threshold=0.9,
+        ... )
+
+        Keep all candidates per left row instead of best-only:
+
+        >>> fuzzy_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     keep_all_candidates=True,
+        ... )
     """
     from pyspark.sql import Window
     from pyspark.sql import functions as F
@@ -249,7 +309,40 @@ def fill_missing_from_match(
     overwrite: bool = False,
     audit_prefix: str = "_match",
 ) -> "DataFrame":
-    """Fill selected left columns from the best fuzzy right-side match."""
+    """Fill selected left columns from the best fuzzy right-side match.
+
+    For each left row, the best fuzzy match on ``(left_on, right_on)`` is
+    used to fill ``fill_cols``. By default only nulls are filled
+    (``overwrite=False``). Audit columns prefixed by ``audit_prefix`` are
+    appended so callers can review which row was used.
+
+    Examples:
+        Fill missing columns from a matched reference row:
+
+        >>> filled = fill_missing_from_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     fill_cols=["fk_id", "attr"],
+        ...     threshold=0.85,
+        ... )
+        >>> filled.select("value", "fk_id", "_match_score", "_match_right_text").show()
+
+        Overwrite existing values too (not just nulls):
+
+        >>> fill_missing_from_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     fill_cols=["fk_id"], overwrite=True,
+        ... )
+
+        Use a custom audit-column prefix to avoid collisions:
+
+        >>> fill_missing_from_match(
+        ...     left=left_df, right=right_df,
+        ...     left_on="value", right_on="value_ref",
+        ...     fill_cols=["fk_id"], audit_prefix="_ref",
+        ... )
+    """
     from pyspark.sql import functions as F
 
     cols = _unique(list(fill_cols))
@@ -354,8 +447,8 @@ def ml_fuzzy_match(
 ) -> "DataFrame":
     """Return fuzzy matches using PySpark ML MinHashLSH over char n-grams.
 
-    Character n-grams are better for business names than plain word tokens:
-    they can still line up strings like `Wal Mart` and `Walmart`. MinHashLSH
+    Character n-grams are better for messy labels than plain word tokens:
+    they can still line up strings like `a b c` and `abc`. MinHashLSH
     returns approximate Jaccard distance over hashed n-gram sets.
     """
     from pyspark.ml.feature import HashingTF, MinHashLSH
@@ -487,9 +580,9 @@ def infer_key_from_text(
 ) -> "DataFrame":
     """Infer a missing key from a fuzzy match on a text column.
 
-    `reference` should contain the trusted key/text pairs, such as
-    `(business_id, business_name)`. `left` may have a null key column or no
-    key column at all. By default this uses the PySpark ML MinHashLSH matcher.
+    ``reference`` should contain trusted key/text pairs, such as
+    ``(id, value_ref)``. ``left`` may have a null key column or no key column
+    at all. By default this uses the PySpark ML MinHashLSH matcher.
     """
     from pyspark.sql import functions as F
 
