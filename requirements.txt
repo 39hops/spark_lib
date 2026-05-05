@@ -1,4 +1,6 @@
 build>=1.2
+delta-spark
 pandas
 openpyxl
 pyspark
+pytest

@@ -5,7 +5,8 @@ import logging
 import re
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Empty, Queue
+from threading import Lock, Thread
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -203,12 +204,17 @@ def run_parallel(
     pool: Optional[str] = None,
     fail_fast: bool = False,
 ) -> List[Union[T, BaseException]]:
-    """Run ``fn(**job)`` for every job concurrently via ``ThreadPoolExecutor``.
+    """Run ``fn(**job)`` for every job concurrently in worker threads.
 
     Each job is a dict whose keys map to ``fn``'s keyword arguments. An
     optional ``"name"`` key is used in log lines. Failures are returned as
     exception objects in the result list (not raised), unless
     ``fail_fast=True`` in which case the first failure cancels the rest.
+
+    This parallelizes submissions from the driver. Spark only spreads work
+    across executors when ``fn`` launches distributed Spark actions; driver-
+    bound catalog/DDL calls can still appear to use one executor or no
+    executor work at all.
 
     Examples:
         Run a function across many inputs:
@@ -226,11 +232,18 @@ def run_parallel(
 
         >>> run_parallel(load, jobs, fail_fast=True)
     """
-    sc: Any = get_spark().sparkContext
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+    spark: Any = get_spark()
+    sc: Any = spark.sparkContext
+    if pool is not None:
+        _warn_if_pool_without_fair(sc, pool)
     results: List[Any] = [None] * len(jobs)
 
     def _worker(idx: int, job: Dict[str, Any]) -> Tuple[int, Any]:
+        previous_pool: Optional[str] = None
         if pool is not None:
+            previous_pool = sc.getLocalProperty("spark.scheduler.pool")
             sc.setLocalProperty("spark.scheduler.pool", pool)
         name: str = str(job.get("name", f"job_{idx}"))
         t0: float = time.monotonic()
@@ -248,6 +261,9 @@ def run_parallel(
             )
             log.debug("[%s] traceback", name, exc_info=exc)
             return idx, exc
+        finally:
+            if pool is not None:
+                sc.setLocalProperty("spark.scheduler.pool", previous_pool)
         log.info("[%s] done in %.1fs", name, time.monotonic() - t0)
         return idx, value
 
@@ -257,16 +273,14 @@ def run_parallel(
         max_workers,
         pool,
     )
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_worker, i, j) for i, j in enumerate(jobs)]
-        try:
-            for fut in as_completed(futures):
-                idx, value = fut.result()
-                results[idx] = value
-        except BaseException:
-            for f in futures:
-                f.cancel()
-            raise
+    _run_worker_threads(
+        _worker,
+        jobs,
+        results,
+        max_workers=max_workers,
+        fail_fast=fail_fast,
+        spark=spark,
+    )
 
     failures: int = sum(1 for r in results if isinstance(r, BaseException))
     if failures:
@@ -284,6 +298,10 @@ def drop_database_tables(
     dry_run: bool = False,
 ) -> List[Union[str, BaseException]]:
     """Drop managed/external tables in ``database`` concurrently.
+
+    The concurrency here is driver-side SQL submission. ``DROP TABLE`` is
+    catalog/DDL-heavy, so it may not consume all executors even when several
+    drop statements are submitted in parallel.
 
     Args:
         database: Database/schema to clean.
@@ -358,6 +376,83 @@ def drop_database_tables(
 
 def _qualified_identifier(database: str, table: str) -> str:
     return f"{_quote_identifier(database)}.{_quote_identifier(table)}"
+
+
+def _run_worker_threads(
+    worker: Callable[[int, Dict[str, Any]], Tuple[int, Any]],
+    jobs: List[Dict[str, Any]],
+    results: List[Any],
+    *,
+    max_workers: int,
+    fail_fast: bool,
+    spark: Any,
+) -> None:
+    job_queue: "Queue[Tuple[int, Dict[str, Any]]]" = Queue()
+    for item in enumerate(jobs):
+        job_queue.put(item)
+
+    first_failure: List[BaseException] = []
+    failure_lock: Lock = Lock()
+
+    def _thread_main() -> None:
+        while True:
+            if fail_fast and first_failure:
+                return
+            try:
+                idx, job = job_queue.get_nowait()
+            except Empty:
+                return
+            try:
+                result_idx, value = worker(idx, job)
+                results[result_idx] = value
+            except BaseException as exc:
+                if fail_fast:
+                    with failure_lock:
+                        if not first_failure:
+                            first_failure.append(exc)
+                    return
+                results[idx] = exc
+            finally:
+                job_queue.task_done()
+
+    thread_cls: Any = _spark_thread_class()
+    threads: List[Any] = []
+    for _ in range(min(max_workers, len(jobs))):
+        if thread_cls is Thread:
+            thread: Any = thread_cls(target=_thread_main)
+        else:
+            thread = thread_cls(target=_thread_main, session=spark)
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    if first_failure:
+        raise first_failure[0]
+
+
+def _spark_thread_class() -> Any:
+    try:
+        from pyspark import InheritableThread
+    except Exception:
+        return Thread
+    return InheritableThread
+
+
+def _warn_if_pool_without_fair(sc: Any, pool: str) -> None:
+    try:
+        mode: str = str(sc.getConf().get("spark.scheduler.mode", "FIFO"))
+    except Exception:
+        return
+    if mode.upper() != "FAIR":
+        log.warning(
+            "pool=%s was requested, but spark.scheduler.mode=%s; "
+            "Spark will not schedule jobs across FAIR pools unless FAIR mode "
+            "is configured when the session starts",
+            pool,
+            mode,
+        )
 
 
 def _quote_identifier(identifier: str) -> str:

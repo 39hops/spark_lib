@@ -116,17 +116,25 @@ no shuffle beyond the partitionBy.
 
 ### `run_parallel(fn, jobs, max_workers=4, pool=None, fail_fast=False)`
 
-Runs `fn(**job)` for every job concurrently via `ThreadPoolExecutor`. If
-`pool` is given, sets `spark.scheduler.pool` on the worker thread (requires
-Spark FAIR scheduling). On `fail_fast=True`, the first failure cancels
+Runs `fn(**job)` for every job concurrently in worker threads. When PySpark is
+available, it uses Spark's `InheritableThread` so thread-local Spark scheduler
+properties are carried correctly. If `pool` is given, sets
+`spark.scheduler.pool` on the worker thread (requires Spark FAIR scheduling).
+The pool property is restored after each worker so one parallel run does not
+leak into the next. On `fail_fast=True`, the first failure cancels
 in-flight futures. Otherwise, exceptions are returned in-place inside the
 results list and a single warning per failure is logged (full tracebacks
 go to debug level).
 
+This is driver-side concurrency. It helps when multiple independent Spark
+actions can be submitted at once, but Spark only spreads work across executors
+when those actions have distributed tasks.
+
 ### `drop_database_tables(database, *, tables=None, include_views=False, max_workers=8, pool=None, dry_run=False)`
 
 Drops all managed/external tables in a database concurrently. Views are skipped
-unless `include_views=True`.
+unless `include_views=True`. Because `DROP TABLE` is mostly catalog/DDL work,
+it can still appear driver-bound in the Spark UI even with `max_workers > 1`.
 
 ```python
 from spark_lib import drop_database_tables
@@ -389,6 +397,19 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
+## Local Tests
+
+Install the test extras, then run pytest:
+
+```bash
+python -m pip install -e ".[test,excel]"
+pytest
+```
+
+The tests create a local `SparkSession` with a temporary warehouse and Delta
+Lake enabled through `delta-spark`. Spark-dependent tests skip cleanly if
+PySpark, Delta, Java, or local Spark startup are unavailable.
+
 ## Build A Wheel
 
 ```bash
@@ -444,7 +465,9 @@ exec_py_from_abfss(
   `abfss://` outputs default to delta.
 - Excel I/O is driver-side via pandas — for report-sized data, not bulk.
 - `run_parallel` uses threads and assumes Spark FAIR scheduling is configured
-  at session start when using scheduler pools.
+  at session start when using scheduler pools. Passing `pool=` only affects
+  Spark jobs that actually launch distributed tasks; DDL/catalog calls are
+  usually driver/metastore-bound.
 
 ## License
 

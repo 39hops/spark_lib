@@ -15,6 +15,11 @@ dependencies = []
 [project.optional-dependencies]
 excel = ["pandas", "openpyxl"]
 spark = ["pyspark"]
+test = ["delta-spark", "pytest", "pyspark"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.setuptools.packages.find]
 where = ["."]
