@@ -2,7 +2,15 @@ from typing import Any, Dict, List, Set, cast
 
 from pyspark.sql import DataFrame, Row, Window, WindowSpec
 from pyspark.sql.functions import (
-    col, collect_list, desc, lower, row_number, size, struct, transform, trim,
+    col,
+    collect_list,
+    desc,
+    lower,
+    row_number,
+    size,
+    struct,
+    transform,
+    trim,
 )
 
 from spark_lib import Input, clean_columns, quiet_azure_logging, set_spark
@@ -13,7 +21,9 @@ SOURCE_VERSION: str = "1.2"
 LAB_DB: str = "lab"
 STATE_TABLE: str = f"{LAB_DB}.__spark_lib_delta_sync_state"
 MAX_WORKERS: int = 8
-PK_METADATA_CSV: str = "abfss://<container>@<account>.dfs.core.windows.net/config/table_primary_keys.csv"
+PK_METADATA_CSV: str = (
+    "abfss://<container>@<account>.dfs.core.windows.net/config/table_primary_keys.csv"
+)
 SPARK_CONF: Dict[str, Any] = {
     "spark.databricks.delta.schema.autoMerge.enabled": "true",
 }
@@ -74,18 +84,19 @@ def load_specs(path: str) -> List[SyncSpec]:
         .rowsBetween(Window.unboundedPreceding, Window.currentRow)
     )
     pick_complete: WindowSpec = Window.partitionBy("src_db", "src_table").orderBy(
-        desc("pk_count"), desc("position"),
+        desc("pk_count"),
+        desc("position"),
     )
     grouped: DataFrame = (
         ordered.withColumn("pk_structs", collect_list("pk_struct").over(table_window))
-               .withColumn("pk_count", size("pk_structs"))
-               .withColumn("__rn", row_number().over(pick_complete))
-               .where(col("__rn") == 1)
-               .select(
-                   "src_db",
-                   "src_table",
-                   transform("pk_structs", lambda x: x["column_name"]).alias("pks"),
-               )
+        .withColumn("pk_count", size("pk_structs"))
+        .withColumn("__rn", row_number().over(pick_complete))
+        .where(col("__rn") == 1)
+        .select(
+            "src_db",
+            "src_table",
+            transform("pk_structs", lambda x: x["column_name"]).alias("pks"),
+        )
     )
 
     specs: List[SyncSpec] = []
@@ -93,15 +104,19 @@ def load_specs(path: str) -> List[SyncSpec]:
         data: Dict[str, Any] = row.asDict()
         pks: List[str] = [str(c).strip() for c in data["pks"] if str(c).strip()]
         if not pks:
-            raise ValueError(f"{data['src_db']}.{data['src_table']} has no primary keys in metadata CSV")
+            raise ValueError(
+                f"{data['src_db']}.{data['src_table']} has no primary keys in metadata CSV"
+            )
         src_db: str = str(data["src_db"]).strip()
         src_table: str = str(data["src_table"]).strip()
-        specs.append({
-            "src_key": f"{src_db}.{src_table}",
-            "src_path": src_path_for(src_db, src_table),
-            "dst_table": dst_table_for(src_table),
-            "pks": pks,
-        })
+        specs.append(
+            {
+                "src_key": f"{src_db}.{src_table}",
+                "src_path": src_path_for(src_db, src_table),
+                "dst_table": dst_table_for(src_table),
+                "pks": pks,
+            }
+        )
     return specs
 
 
@@ -113,4 +128,6 @@ successes, failures = run_sync(specs, state, max_workers=MAX_WORKERS, pool="delt
 if successes:
     display(spark.createDataFrame([dict(s) for s in successes]))
 if failures:
-    raise RuntimeError(f"{len(failures)} table syncs failed; inspect run_parallel logs/results")
+    raise RuntimeError(
+        f"{len(failures)} table syncs failed; inspect run_parallel logs/results"
+    )
