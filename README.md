@@ -189,6 +189,8 @@ resolved = infer_key_from_text(
 
 - `fuzzy_match` uses Levenshtein scoring. Without `block_on`, it joins only
   rows sharing the first two normalized characters to avoid a cross join.
+- `infer_key_from_text` resolves normalized exact matches first by default,
+  then runs fuzzy/ML matching only for rows still missing a key.
 - `ml_fuzzy_match` and `infer_key_from_text(method="ml")` use PySpark ML
   `HashingTF` plus `MinHashLSH` over normalized character n-grams. Better
   for messy labels (`"a b c"` vs `"abc"`).
@@ -329,6 +331,8 @@ Parallel orchestrator. Optimizations:
   workers — avoids N small queries against the same tiny table.
 - **Single batched state MERGE** at the end (`state.upsert_all`) — one Delta
   transaction instead of one per success.
+- Optional `SyncAudit` reads per-table Delta history metrics in parallel and
+  appends one audit row per successful sync.
 - State writes are sequential by design (avoids concurrent Delta-transaction
   conflicts on the state table).
 

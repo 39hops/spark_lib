@@ -33,6 +33,8 @@ _TOKENS = "__spark_lib_tokens"
 _COMPACT = "__spark_lib_compact"
 _FEATURES = "__spark_lib_features"
 _HASHES = "__spark_lib_hashes"
+_EXACT_LEFT_NORM = "__spark_lib_exact_left_norm"
+_EXACT_RIGHT_NORM = "__spark_lib_exact_right_norm"
 _ACCENT_CHARS = "àáâãäåāăąçćčďèéêëēėęěìíîïīįłñńòóôõöøōřśšťùúûüūůýÿžźż"
 _ASCII_CHARS = "aaaaaaaaacccdeeeeeeeeiiiiiilnnooooooorsstuuuuuuyyzzz"
 
@@ -568,6 +570,7 @@ def infer_key_from_text(
     reference_text_col: Optional[str] = None,
     left_id: Optional[str] = None,
     block_on: NameList = None,
+    exact_first: bool = True,
     method: str = "ml",
     threshold: float = 0.8,
     max_distance: Optional[int] = None,
@@ -582,7 +585,11 @@ def infer_key_from_text(
 
     ``reference`` should contain trusted key/text pairs, such as
     ``(id, value_ref)``. ``left`` may have a null key column or no key column
-    at all. By default this uses the PySpark ML MinHashLSH matcher.
+    at all.
+
+    When ``exact_first=True`` (default), normalized exact matches are resolved
+    first and only unresolved rows go through fuzzy matching. This is usually
+    faster and gives deterministic exact matches priority.
     """
     from pyspark.sql import functions as F
 
@@ -603,42 +610,68 @@ def infer_key_from_text(
     _require_absent(left, audit_cols, "left")
     if left_id is None:
         _require_absent(left, [_LEFT_KEY], "left")
+    if exact_first:
+        _require_absent(left, [_EXACT_LEFT_NORM], "left")
+        _require_absent(reference, [_EXACT_RIGHT_NORM], "reference")
     base = _with_key(left, left_key, left_id is None)
     work = base
     if key_exists and not overwrite:
         work = work.where(F.col(key_col).isNull())
 
+    matched: "DataFrame"
+    exact = None
+    if exact_first:
+        exact = _exact_text_match(
+            work,
+            reference,
+            left_on=text_col,
+            right_on=ref_text,
+            left_id=left_key,
+            right_id=ref_key,
+            block_on=blocks,
+            min_chars=min_chars,
+        )
+        work = work.join(
+            exact.select(F.col("left_id").alias(left_key)),
+            left_key,
+            "left_anti",
+        )
+
     method_name = method.lower()
-    if method_name in ("ml", "lsh", "minhash"):
-        matched = ml_fuzzy_match(
-            work,
-            reference,
-            left_on=text_col,
-            right_on=ref_text,
-            left_id=left_key,
-            right_id=ref_key,
-            block_on=block_on,
-            threshold=threshold,
-            min_chars=min_chars,
-            ngram_size=ngram_size,
-            num_features=num_features,
-            num_hash_tables=num_hash_tables,
-        )
-    elif method_name in ("levenshtein", "edit_distance"):
-        matched = fuzzy_match(
-            work,
-            reference,
-            left_on=text_col,
-            right_on=ref_text,
-            left_id=left_key,
-            right_id=ref_key,
-            block_on=block_on,
-            threshold=threshold,
-            max_distance=max_distance,
-            min_chars=min_chars,
-        )
-    else:
+    if method_name not in ("ml", "lsh", "minhash", "levenshtein", "edit_distance"):
         raise ValueError("method must be 'ml' or 'levenshtein'")
+    if _has_rows(work):
+        if method_name in ("ml", "lsh", "minhash"):
+            fuzzy = ml_fuzzy_match(
+                work,
+                reference,
+                left_on=text_col,
+                right_on=ref_text,
+                left_id=left_key,
+                right_id=ref_key,
+                block_on=block_on,
+                threshold=threshold,
+                min_chars=min_chars,
+                ngram_size=ngram_size,
+                num_features=num_features,
+                num_hash_tables=num_hash_tables,
+            )
+        else:
+            fuzzy = fuzzy_match(
+                work,
+                reference,
+                left_on=text_col,
+                right_on=ref_text,
+                left_id=left_key,
+                right_id=ref_key,
+                block_on=block_on,
+                threshold=threshold,
+                max_distance=max_distance,
+                min_chars=min_chars,
+            )
+        matched = fuzzy if exact is None else exact.unionByName(fuzzy)
+    else:
+        matched = _empty_match_frame(work, left_key) if exact is None else exact
 
     matches = matched.select(
         F.col("left_id").alias(left_key),
@@ -670,6 +703,79 @@ def infer_key_from_text(
         ]
     )
     return joined.select(*selected)
+
+
+def _exact_text_match(
+    left: "DataFrame",
+    right: "DataFrame",
+    *,
+    left_on: str,
+    right_on: str,
+    left_id: str,
+    right_id: str,
+    block_on: List[str],
+    min_chars: int,
+) -> "DataFrame":
+    """Return deterministic normalized exact text matches."""
+    from functools import reduce
+    from operator import and_
+    from pyspark.sql import Window
+    from pyspark.sql import functions as F
+
+    ldf = (
+        left.withColumn(_EXACT_LEFT_NORM, normalize_text(left_on))
+            .where(F.length(F.col(_EXACT_LEFT_NORM)) >= F.lit(min_chars))
+    )
+    rdf = (
+        right.withColumn(_EXACT_RIGHT_NORM, normalize_text(right_on))
+             .where(F.length(F.col(_EXACT_RIGHT_NORM)) >= F.lit(min_chars))
+    )
+
+    conditions = [
+        F.col(f"l.{_EXACT_LEFT_NORM}") == F.col(f"r.{_EXACT_RIGHT_NORM}")
+    ]
+    conditions.extend(
+        F.col(f"l.{c}") == F.col(f"r.{c}") for c in block_on
+    )
+    joined = ldf.alias("l").join(rdf.alias("r"), reduce(and_, conditions), "inner")
+    matched = joined.select(
+        F.col(f"l.{left_id}").alias("left_id"),
+        F.col(f"r.{right_id}").alias("right_id"),
+        F.col(f"l.{left_on}").cast("string").alias("left_value"),
+        F.col(f"r.{right_on}").cast("string").alias("right_value"),
+        F.col(f"l.{_EXACT_LEFT_NORM}").alias("left_norm"),
+        F.col(f"r.{_EXACT_RIGHT_NORM}").alias("right_norm"),
+        F.lit(0.0).alias("match_distance"),
+        F.lit(1.0).alias("match_score"),
+    )
+    window = Window.partitionBy("left_id").orderBy(F.asc("right_id"))
+    return matched.withColumn("match_rank", F.row_number().over(window)).where(
+        F.col("match_rank") == 1
+    )
+
+
+def _empty_match_frame(df: "DataFrame", left_id: str) -> "DataFrame":
+    from pyspark.sql import functions as F
+
+    return (
+        df.select(F.col(left_id).alias("left_id"))
+          .where(F.lit(False))
+          .select(
+              F.col("left_id"),
+              F.lit(None).alias("right_id"),
+              F.lit(None).cast("string").alias("left_value"),
+              F.lit(None).cast("string").alias("right_value"),
+              F.lit(None).cast("string").alias("left_norm"),
+              F.lit(None).cast("string").alias("right_norm"),
+              F.lit(None).cast("double").alias("match_distance"),
+              F.lit(None).cast("double").alias("match_score"),
+              F.lit(None).cast("int").alias("match_rank"),
+          )
+    )
+
+
+def _has_rows(df: "DataFrame") -> bool:
+    return bool(df.take(1))
 
 
 def _with_key(df: "DataFrame", key: str, create: bool) -> "DataFrame":

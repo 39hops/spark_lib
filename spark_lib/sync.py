@@ -181,6 +181,7 @@ class SyncAudit:
     Attributes:
         table: Fully-qualified managed Delta audit table, e.g.
             ``"db.__sync_audit"``.
+        max_workers: Thread count for parallel history metric reads.
 
     Example:
         >>> audit = SyncAudit("db.__sync_audit")
@@ -188,6 +189,7 @@ class SyncAudit:
         >>> spark.table("db.__sync_audit").orderBy("audited_at", ascending=False).show()
     """
     table: str
+    max_workers: int = 8
 
     def ensure(self) -> None:
         """Create the audit table if it doesn't exist.
@@ -227,8 +229,10 @@ class SyncAudit:
         """Append one audit row per ``SyncResult`` to the audit table.
 
         For each result whose ``sync_mode`` actually wrote, reads the latest
-        commit's ``operationMetrics`` from ``DESCRIBE HISTORY``. For no-op
-        modes (``already_current``, ``cdf_noop``) all row counts are ``0``.
+        commit's ``operationMetrics`` from ``DESCRIBE HISTORY``. Metric reads
+        are parallelized because every target table has independent history.
+        For no-op modes (``already_current``, ``cdf_noop``) all row counts
+        are ``0``.
 
         Args:
             results: Successful sync results to record. Empty list is a no-op.
@@ -246,8 +250,22 @@ class SyncAudit:
         from pyspark.sql import functions as F
 
         spark = get_spark()
+        jobs: List[Dict[str, Any]] = [
+            {"name": r["src_key"], "result": r} for r in results
+        ]
+        raw: List[Union[SyncAuditRow, BaseException]] = run_parallel(
+            _build_audit_row,
+            jobs,
+            max_workers=self.max_workers,
+            fail_fast=False,
+        )
         rows: List[SyncAuditRow] = [
-            _build_audit_row(r) for r in results
+            (
+                _build_audit_row_without_metrics(results[i])
+                if isinstance(r, BaseException)
+                else r
+            )
+            for i, r in enumerate(raw)
         ]
         df = (
             spark.createDataFrame([dict(r) for r in rows])
@@ -638,12 +656,27 @@ def run_sync(
     return successes, failures
 
 
-def _build_audit_row(result: SyncResult) -> SyncAuditRow:
+def _build_audit_row(
+    result: SyncResult,
+    name: str = "",
+) -> SyncAuditRow:
     mode: str = result["sync_mode"]
     if mode in _WROTE_MODES:
         metrics = _read_last_metrics(result["dst_table"])
     else:
         metrics = {}
+    return _audit_row_from_metrics(result, metrics)
+
+
+def _build_audit_row_without_metrics(result: SyncResult) -> SyncAuditRow:
+    return _audit_row_from_metrics(result, {})
+
+
+def _audit_row_from_metrics(
+    result: SyncResult,
+    metrics: Dict[str, str],
+) -> SyncAuditRow:
+    mode: str = result["sync_mode"]
     return {
         "src_key": result["src_key"],
         "src_path": result["src_path"],
